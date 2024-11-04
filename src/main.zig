@@ -2,29 +2,60 @@ const std = @import("std");
 
 const sdl3 = @cImport({
     @cInclude("SDL3/SDL.h");
+    //    @cInclude("SDL3/SDL_main.h");
     @cInclude("SDL3_image/SDL_image.h");
 });
 
-const gpa = std.heap.GeneralPurposeAllocator(.{}){};
-const allocator = gpa.allocator();
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var ally = gpa.allocator();
+
+const stdoutXX = std.io.GetStdOut().writer();
 
 pub fn main() !void {
+    const start = std.time.nanoTimestamp();
+    gfxpls_main(start) catch |err| {
+        std.debug.print("{!}\n", .{err});
+    };
+    const end = std.time.nanoTimestamp();
+    const runtimeNano = end - start;
+    const runtimeSec = @as(f64, @floatFromInt(runtimeNano)) / 1000 / 1000 / 1000;
+    std.debug.print("gfxpls ran for {d}s\n", .{runtimeSec});
+}
+
+pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
+    //    const start = std.time.nanoTimestamp();
+
+    std.debug.print("STARTED AT = {?}\n", .{start});
+
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
     const stdout = bw.writer();
 
-    const iter = try std.fs.cwd().openIterableDir(".", .{});
-    var it = iter.iterate();
+    var dirlist = std.ArrayList([]const u8).init(ally);
+    defer dirlist.deinit();
+
+    try stdout.print("TYPE OF DIRLIST = {?}", .{dirlist});
+    try bw.flush();
+
+    const dd = try std.fs.openDirAbsolute("/home/willem/projects/gfxpls", .{ .iterate = true });
+
+    var it = dd.iterate();
     while (try it.next()) |item| {
         try stdout.print("Dir Entry: kind={?} name={s}\n", .{ item.kind, item.name });
+        try dirlist.append(item.name);
     }
 
-    if (sdl3.SDL_Init(sdl3.SDL_INIT_VIDEO) != 0) {
+    if (sdl3.SDL_Init(sdl3.SDL_INIT_VIDEO) == false) {
         try stdout.print("sdl init failed\n", .{});
+        try bw.flush();
+
+        const sdlErr = sdl3.SDL_GetError();
+        try stdout.print("sdl err = {s}", .{sdlErr});
+        try bw.flush();
         return;
     }
 
-    var window = sdl3.SDL_CreateWindow(
+    const window = sdl3.SDL_CreateWindow(
         "ZIGGY",
         800,
         600,
@@ -41,22 +72,32 @@ pub fn main() !void {
         return;
     }
 
-    var img = sdl3.IMG_Load("/home/willem/projects/gfxpls/dothackslash.png");
+    const img = sdl3.IMG_Load("/home/willem/projects/gfxpls/dothackslash.png");
     try stdout.print("img result = {*}, err = {s}\n", .{ img, sdl3.SDL_GetError() });
     try bw.flush();
 
-    var surface = sdl3.SDL_GetWindowSurface(window);
+    const surface = sdl3.SDL_GetWindowSurface(window);
     _ = sdl3.SDL_BlitSurface(img, null, surface, null);
     _ = sdl3.SDL_UpdateWindowSurface(window);
 
     var quit = false;
-    var e: sdl3.SDL_Event = undefined;
 
     while (!quit) {
-        while (sdl3.SDL_PollEvent(&e) != 0) {
+        var e: sdl3.SDL_Event = undefined;
+        while (sdl3.SDL_PollEvent(&e)) {
             if (e.type == sdl3.SDL_EVENT_QUIT) {
                 quit = true;
+            } else if (e.type == sdl3.SDL_EVENT_KEY_UP) {
+                try stdout.print("key event = {?}\n", .{e});
+                if (e.key.key == sdl3.SDLK_ESCAPE) {
+                    quit = true;
+                } else if (e.key.key == sdl3.SDLK_PAGEDOWN) {
+                    for (dirlist.items) |entry| {
+                        try stdout.print("D -> {s}\n", .{entry});
+                    }
+                }
             }
+            try bw.flush();
         }
     }
 }
