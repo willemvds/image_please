@@ -224,6 +224,7 @@ const MainContext = struct {
     current_image: CurrentImage,
     current_image_idx: usize = 0,
     image_load_buffer: []u8,
+    image_index_ready: bool = false,
     image_index: std.ArrayList([]const u8),
     image_index_dir: ?std.fs.Dir = null,
     image_index_iter: ?std.fs.Dir.Iterator = null,
@@ -272,6 +273,8 @@ const MainContext = struct {
                 self.current_image_idx = idx;
             }
         }
+
+        self.image_index_ready = true;
     }
 
     fn loop(self: *Self, events: *std.ArrayListAligned(Event, null)) !LoopResult {
@@ -323,7 +326,7 @@ const MainContext = struct {
         while (sdl3.SDL_PollEvent(&e)) {
             if (e.type == sdl3.SDL_EVENT_QUIT) {
                 quit = true;
-            } else if (e.type == sdl3.SDL_EVENT_KEY_UP) {
+            } else if (e.type == sdl3.SDL_EVENT_KEY_DOWN) {
                 if (e.key.key == sdl3.SDLK_ESCAPE) {
                     quit = true;
                 } else if (e.key.key == sdl3.SDLK_PAGEDOWN or e.key.key == sdl3.SDLK_RIGHT) {
@@ -332,6 +335,14 @@ const MainContext = struct {
                     } else |_| {}
                 } else if (e.key.key == sdl3.SDLK_PAGEUP or e.key.key == sdl3.SDLK_LEFT) {
                     if (self.loadImageBefore(self.current_image.filename)) |ev| {
+                        try new_events.append(ev);
+                    } else |_| {}
+                } else if (e.key.key == sdl3.SDLK_HOME) {
+                    if (self.loadFirstImage()) |ev| {
+                        try new_events.append(ev);
+                    } else |_| {}
+                } else if (e.key.key == sdl3.SDLK_END) {
+                    if (self.loadLastImage()) |ev| {
                         try new_events.append(ev);
                     } else |_| {}
                 }
@@ -359,7 +370,64 @@ const MainContext = struct {
         };
     }
 
+    fn loadFirstImage(self: *Self) !Event {
+        if (self.image_index_ready == false) {
+            return error.IMAGE_INDEX_NOT_READY;
+        }
+
+        const idx = 0;
+        //std.sort.binarySearch([]const u8, name, self.image_index.items, name, ziglyph.Collator.ascending);
+
+        const indexed_name = self.image_index.items[idx];
+        std.debug.print("-- (first) want to load {d} {s}\n", .{ idx, indexed_name });
+
+        if (self.image_index_dir) |iid| {
+            if (iid.readFile(indexed_name, self.image_load_buffer)) |file_contents| {
+                const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
+                const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
+                if (img_surface != null) {
+                    const texture = try textureFromSurface(self.renderer, img_surface);
+                    sdl3.SDL_DestroySurface(img_surface);
+                    self.current_image_idx = idx;
+                    return Event{ .image_loaded = ImageLoaded{ .filename = indexed_name, .texture = texture } };
+                }
+            } else |_| {}
+        }
+
+        return error.AWWELL;
+    }
+
+    fn loadLastImage(self: *Self) !Event {
+        if (self.image_index_ready == false) {
+            return error.IMAGE_INDEX_NOT_READY;
+        }
+
+        const idx = self.image_index.items.len - 1;
+        //std.sort.binarySearch([]const u8, name, self.image_index.items, name, ziglyph.Collator.ascending);
+
+        const indexed_name = self.image_index.items[idx];
+        std.debug.print("-- (last) want to load {d} {s}\n", .{ idx, indexed_name });
+
+        if (self.image_index_dir) |iid| {
+            if (iid.readFile(indexed_name, self.image_load_buffer)) |file_contents| {
+                const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
+                const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
+                if (img_surface != null) {
+                    const texture = try textureFromSurface(self.renderer, img_surface);
+                    sdl3.SDL_DestroySurface(img_surface);
+                    self.current_image_idx = idx;
+                    return Event{ .image_loaded = ImageLoaded{ .filename = indexed_name, .texture = texture } };
+                }
+            } else |_| {}
+        }
+
+        return error.AWWELL;
+    }
+
     fn loadImageBefore(self: *Self, name: []const u8) !Event {
+        if (self.image_index_ready == false) {
+            return error.IMAGE_INDEX_NOT_READY;
+        }
         _ = name;
         const idx = self.current_image_idx;
         //std.sort.binarySearch([]const u8, name, self.image_index.items, name, ziglyph.Collator.ascending);
@@ -386,6 +454,10 @@ const MainContext = struct {
     }
 
     fn loadImageAfter(self: *Self, name: []const u8) !Event {
+        if (self.image_index_ready == false) {
+            return error.IMAGE_INDEX_NOT_READY;
+        }
+
         _ = name;
         const idx = self.current_image_idx;
 
@@ -449,8 +521,10 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
     }
     const window_title = "gfxpls";
     const window_flags =
+
         //sdl3.SDL_WINDOW_TRANSPARENT |
         sdl3.SDL_WINDOW_BORDERLESS |
+        sdl3.SDL_WINDOW_FULLSCREEN |
         //sdl3.SDL_WINDOW_HIGH_PIXEL_DENSITY |
         sdl3.SDL_WINDOW_INPUT_FOCUS |
         sdl3.SDL_WINDOW_RESIZABLE;
