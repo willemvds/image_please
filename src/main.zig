@@ -31,6 +31,8 @@ const Event = union(EventTag) {
     image_loaded: ImageLoaded,
 };
 
+const StringSlice = []const u8;
+
 const SDL_CLOSE_IO = true;
 const SDL_NO_CLOSE_IO = false;
 
@@ -155,12 +157,11 @@ pub fn loadFirstImageFromDir(target_path: []const u8) !LoadFirstImageFromDirResu
 }
 
 pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !void {
-    _ = sdl3.SDL_RenderClear(renderer);
     var w: c_int = 0;
     var h: c_int = 0;
     _ = sdl3.SDL_GetCurrentRenderOutputSize(renderer, &w, &h);
-    std.debug.print("rendering w,h = {}, {}\n", .{ w, h });
-    std.debug.print("tex w,h = {}, {}\n", .{ tex.w, tex.h });
+    //    std.debug.print("rendering w,h = {}, {}\n", .{ w, h });
+    //    std.debug.print("tex w,h = {}, {}\n", .{ tex.w, tex.h });
     if ((tex.w > w) or (tex.h > h)) {
         const wf = @as(f32, @floatFromInt(w));
         const hf = @as(f32, @floatFromInt(h));
@@ -187,8 +188,8 @@ pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !v
             .h = target_h,
         };
 
-        const rr = sdl3.SDL_RenderTexture(renderer, tex, null, &dst_rect);
-        std.debug.print("render(scaled) result = {}\n", .{rr});
+        _ = sdl3.SDL_RenderTexture(renderer, tex, null, &dst_rect);
+        //std.debug.print("render(scaled) result = {}\n", .{rr});
     } else {
         const wf = @as(f32, @floatFromInt(w));
         const hf = @as(f32, @floatFromInt(h));
@@ -203,18 +204,24 @@ pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !v
             .h = tex_h,
         };
 
-        const rr = sdl3.SDL_RenderTexture(renderer, tex, null, &dst_rect);
-        std.debug.print("render result = {}\n", .{rr});
+        _ = sdl3.SDL_RenderTexture(renderer, tex, null, &dst_rect);
+        //std.debug.print("render result = {}\n", .{rr});
     }
 }
 
 const EventList = std.ArrayList(Event);
 
+const CurrentImage = struct {
+    filename: StringSlice = "",
+    texture: *sdl3.SDL_Texture,
+};
+
 const MainContext = struct {
     a: std.mem.Allocator,
     window: *sdl3.SDL_Window,
     renderer: *sdl3.SDL_Renderer,
-    current_image_filename: []const u8 = "",
+    frames: u64 = 0,
+    current_image: CurrentImage,
     current_image_idx: usize = 0,
     image_index: std.ArrayList([]const u8),
     image_index_dir: ?std.fs.Dir = null,
@@ -237,11 +244,15 @@ const MainContext = struct {
             .window = window,
             .renderer = renderer,
             .image_index = std.ArrayList([]const u8).init(a),
+            .current_image = CurrentImage{ .filename = "", .texture = undefined },
         };
     }
 
     fn handleImageLoaded(self: *Self, ev: ImageLoaded) void {
-        self.current_image_filename = ev.filename;
+        self.current_image = CurrentImage{
+            .filename = ev.filename,
+            .texture = ev.texture,
+        };
         try showImageTexture(self.renderer, ev.texture);
     }
 
@@ -252,7 +263,7 @@ const MainContext = struct {
         std.mem.sort([]const u8, self.image_index.items, c, ziglyph.Collator.ascending);
         for (self.image_index.items, 0..) |iname, idx| {
             std.debug.print("idx {d} = {s}\n", .{ idx, iname });
-            if (std.mem.eql(u8, iname, self.current_image_filename)) {
+            if (std.mem.eql(u8, iname, self.current_image.filename)) {
                 self.current_image_idx = idx;
             }
         }
@@ -264,6 +275,7 @@ const MainContext = struct {
         while (events.popOrNull()) |event| {
             switch (event) {
                 .image_loaded => {
+                    _ = sdl3.SDL_RenderClear(self.renderer);
                     self.handleImageLoaded(event.image_loaded);
                     if (sdl3.SDL_RenderPresent(self.renderer) == false) return error.SDL;
                 },
@@ -309,16 +321,31 @@ const MainContext = struct {
                 if (e.key.key == sdl3.SDLK_ESCAPE) {
                     quit = true;
                 } else if (e.key.key == sdl3.SDLK_PAGEDOWN or e.key.key == sdl3.SDLK_RIGHT) {
-                    if (self.loadImageAfter(self.current_image_filename)) |ev| {
+                    if (self.loadImageAfter(self.current_image.filename)) |ev| {
                         try new_events.append(ev);
                     } else |_| {}
                 } else if (e.key.key == sdl3.SDLK_PAGEUP or e.key.key == sdl3.SDLK_LEFT) {
-                    if (self.loadImageBefore(self.current_image_filename)) |ev| {
+                    if (self.loadImageBefore(self.current_image.filename)) |ev| {
                         try new_events.append(ev);
                     } else |_| {}
                 }
+            } else if (e.type == sdl3.SDL_EVENT_WINDOW_RESIZED) {
+                const wev = e.window;
+                std.debug.print("RESIZE = {} {} {} {}\n", .{ wev.type, wev.windowID, wev.data1, wev.data2 });
+
+                const rcr = sdl3.SDL_RenderClear(self.renderer);
+                std.debug.print("Render Clear Result = {}\n", .{rcr});
+                try showImageTexture(self.renderer, self.current_image.texture);
+                const rpr = sdl3.SDL_RenderPresent(self.renderer);
+                std.debug.print("Render Present Result = {}\n", .{rpr});
             }
         }
+
+        _ = sdl3.SDL_RenderClear(self.renderer);
+        try showImageTexture(self.renderer, self.current_image.texture);
+        _ = sdl3.SDL_RenderPresent(self.renderer);
+
+        self.frames += 1;
 
         return LoopResult{
             .events = new_events,
@@ -395,21 +422,29 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
         return error.SDL;
     }
 
-    const display_mode = sdl3.SDL_GetDesktopDisplayMode(@as(sdl3.SDL_DisplayID, 1));
+    var num_displays: c_int = 0;
+    const displays: [*c]sdl3.SDL_DisplayID = sdl3.SDL_GetDisplays(&num_displays);
+    if (num_displays < 1) {
+        return error.SDL;
+    }
+
+    var window_w: c_int = 1920;
+    var window_h: c_int = 1080;
+    const display_mode = sdl3.SDL_GetDesktopDisplayMode(@as(sdl3.SDL_DisplayID, displays[0]));
     if (display_mode) |dm| {
         const dmo = dm.*;
         std.debug.print("display mode = {}, {}, {}, {} {}\n", .{ dmo.w, dmo.h, dmo.pixel_density, dmo.refresh_rate, dmo.format });
+        window_w = dmo.w;
+        window_h = dmo.h;
     } else {
         std.debug.print("sdl err = {s}\n", .{sdl3.SDL_GetError()});
     }
     const window_title = "gfxpls";
-    //const window_w = 2560;
-    //const window_h = 1440;
-    const window_w = 1400;
-    const window_h = 900;
-    const window_flags = sdl3.SDL_WINDOW_BORDERLESS | sdl3.SDL_WINDOW_INPUT_FOCUS;
-    //| sdl3.SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    //| sdl3.SDL_WINDOW_TRANSPARENT;
+    const window_flags =
+        //sdl3.SDL_WINDOW_TRANSPARENT |
+        //sdl3.SDL_WINDOW_BORDERLESS |
+        //sdl3.SDL_WINDOW_HIGH_PIXEL_DENSITY |
+        sdl3.SDL_WINDOW_INPUT_FOCUS | sdl3.SDL_WINDOW_RESIZABLE;
 
     var window: ?*sdl3.SDL_Window = undefined;
     var renderer: ?*sdl3.SDL_Renderer = undefined;
@@ -424,6 +459,9 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
     )) {
         return error.SDL;
     }
+
+    // SDL_GetDisplayForWindow
+    //
     //const stdout_file = std.io.getStdOut().writer();
     //var bw = std.io.bufferedWriter(stdout_file);
     //const stdout = bw.writer();
