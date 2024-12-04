@@ -223,6 +223,7 @@ const MainContext = struct {
     frames: u64 = 0,
     current_image: CurrentImage,
     current_image_idx: usize = 0,
+    image_load_buffer: []u8,
     image_index: std.ArrayList([]const u8),
     image_index_dir: ?std.fs.Dir = null,
     image_index_iter: ?std.fs.Dir.Iterator = null,
@@ -238,17 +239,21 @@ const MainContext = struct {
         a: std.mem.Allocator,
         window: *sdl3.SDL_Window,
         renderer: *sdl3.SDL_Renderer,
-    ) MainContext {
+        max_image_size: usize,
+    ) !MainContext {
+        const image_load_buffer = try a.alignedAlloc(u8, @alignOf(u8), max_image_size);
         return MainContext{
             .a = a,
             .window = window,
             .renderer = renderer,
             .image_index = std.ArrayList([]const u8).init(a),
             .current_image = CurrentImage{ .filename = "", .texture = undefined },
+            .image_load_buffer = image_load_buffer,
         };
     }
 
     fn handleImageLoaded(self: *Self, ev: ImageLoaded) void {
+        sdl3.SDL_DestroyTexture(self.current_image.texture);
         self.current_image = CurrentImage{
             .filename = ev.filename,
             .texture = ev.texture,
@@ -298,10 +303,11 @@ const MainContext = struct {
                 self.image_index_iter = casted_iter;
 
                 if (self.image_index_dir) |iid| {
-                    if (iid.readFileAlloc(self.a, entry.name, 10 * MB)) |file_contents| {
+                    if (iid.readFile(entry.name, self.image_load_buffer)) |file_contents| {
                         const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
                         const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
                         if (img_surface != null) {
+                            sdl3.SDL_DestroySurface(img_surface);
                             try self.image_index.append(try ally.dupe(u8, entry.name));
                         }
                     } else |_| {}
@@ -363,11 +369,12 @@ const MainContext = struct {
             std.debug.print("-- (before) want to load {d} {s}\n", .{ idx - 1, indexed_name });
 
             if (self.image_index_dir) |iid| {
-                if (iid.readFileAlloc(self.a, indexed_name, 10 * MB)) |file_contents| {
+                if (iid.readFile(indexed_name, self.image_load_buffer)) |file_contents| {
                     const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
                     const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
                     if (img_surface != null) {
                         const texture = try textureFromSurface(self.renderer, img_surface);
+                        sdl3.SDL_DestroySurface(img_surface);
                         self.current_image_idx = idx - 1;
                         return Event{ .image_loaded = ImageLoaded{ .filename = indexed_name, .texture = texture } };
                     }
@@ -387,11 +394,12 @@ const MainContext = struct {
             std.debug.print("-- (after) want to load {d} {s}\n", .{ idx + 1, indexed_name });
 
             if (self.image_index_dir) |iid| {
-                if (iid.readFileAlloc(self.a, indexed_name, 10 * MB)) |file_contents| {
+                if (iid.readFile(indexed_name, self.image_load_buffer)) |file_contents| {
                     const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
                     const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
                     if (img_surface != null) {
                         const texture = try textureFromSurface(self.renderer, img_surface);
+                        sdl3.SDL_DestroySurface(img_surface);
                         self.current_image_idx = idx + 1;
                         return Event{ .image_loaded = ImageLoaded{ .filename = indexed_name, .texture = texture } };
                     }
@@ -442,9 +450,10 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
     const window_title = "gfxpls";
     const window_flags =
         //sdl3.SDL_WINDOW_TRANSPARENT |
-        //sdl3.SDL_WINDOW_BORDERLESS |
+        sdl3.SDL_WINDOW_BORDERLESS |
         //sdl3.SDL_WINDOW_HIGH_PIXEL_DENSITY |
-        sdl3.SDL_WINDOW_INPUT_FOCUS | sdl3.SDL_WINDOW_RESIZABLE;
+        sdl3.SDL_WINDOW_INPUT_FOCUS |
+        sdl3.SDL_WINDOW_RESIZABLE;
 
     var window: ?*sdl3.SDL_Window = undefined;
     var renderer: ?*sdl3.SDL_Renderer = undefined;
@@ -519,7 +528,7 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
             const render_at = std.time.nanoTimestamp();
             std.debug.print("First render at {d}\n", .{render_at - start});
 
-            var main_context = MainContext.init(ally, w, r);
+            var main_context = try MainContext.init(ally, w, r, 10 * MB);
 
             var quit = false;
             while (!quit) {
