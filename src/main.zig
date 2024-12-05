@@ -156,6 +156,27 @@ pub fn loadFirstImageFromDir(target_path: []const u8) !LoadFirstImageFromDirResu
     return LoadFirstImageFromDirResult{ .no_image_loaded = undefined };
 }
 
+pub fn buildImageIndex(
+    dir: std.fs.Dir,
+    dir_iter: std.fs.Dir.Iterator,
+    image_index: *std.ArrayList(StringSlice),
+    image_load_buffer: []u8,
+    done_event: *std.Thread.ResetEvent,
+) !void {
+    var casted_iter = @as(std.fs.Dir.Iterator, dir_iter);
+    while (try casted_iter.next()) |entry| {
+        if (dir.readFile(entry.name, image_load_buffer)) |file_contents| {
+            const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
+            const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
+            if (img_surface != null) {
+                sdl3.SDL_DestroySurface(img_surface);
+                try image_index.*.append(try ally.dupe(u8, entry.name));
+            }
+        } else |_| {}
+    }
+    done_event.set();
+}
+
 pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !void {
     var w: c_int = 0;
     var h: c_int = 0;
@@ -228,6 +249,8 @@ const MainContext = struct {
     image_index: std.ArrayList([]const u8),
     image_index_dir: ?std.fs.Dir = null,
     image_index_iter: ?std.fs.Dir.Iterator = null,
+    image_index_wip: std.ArrayList([]const u8),
+    wip_completed: std.Thread.ResetEvent,
 
     const Self = @This();
 
@@ -248,6 +271,8 @@ const MainContext = struct {
             .window = window,
             .renderer = renderer,
             .image_index = std.ArrayList([]const u8).init(a),
+            .image_index_wip = std.ArrayList([]const u8).init(a),
+            .wip_completed = std.Thread.ResetEvent{},
             .current_image = CurrentImage{ .filename = "", .texture = undefined },
             .image_load_buffer = image_load_buffer,
         };
@@ -262,9 +287,21 @@ const MainContext = struct {
         try showImageTexture(self.renderer, ev.texture);
     }
 
+    fn handleDirOpened(self: *Self, ev: DirOpened) !void {
+        self.image_index_dir = ev.dir;
+        self.image_index_iter = ev.iter;
+
+        const thread = try std.Thread.spawn(.{}, buildImageIndex, .{ self.image_index_dir.?, self.image_index_iter.?, &self.image_index_wip, self.image_load_buffer, &self.wip_completed });
+        thread.detach();
+    }
+
     fn handleDirImageIndexBuilt(self: *Self) !void {
         var c = try ziglyph.Collator.init(self.a);
         defer c.deinit();
+
+        self.image_index.deinit();
+        self.image_index = self.image_index_wip;
+        self.image_index_wip = std.ArrayList(StringSlice).init(self.a);
 
         std.mem.sort([]const u8, self.image_index.items, c, ziglyph.Collator.ascending);
         for (self.image_index.items, 0..) |iname, idx| {
@@ -288,11 +325,10 @@ const MainContext = struct {
                     if (sdl3.SDL_RenderPresent(self.renderer) == false) return error.SDL;
                 },
                 .dir_opened => {
-                    self.image_index_dir = event.dir_opened.dir;
-                    self.image_index_iter = event.dir_opened.iter;
-                    if (event.dir_opened.idx_this.len > 0) {
-                        try self.image_index.append(event.dir_opened.idx_this);
-                    }
+                    try self.handleDirOpened(event.dir_opened);
+                    //if (event.dir_opened.idx_this.len > 0) {
+                    //    try self.image_index.append(event.dir_opened.idx_this);
+                    //}
                 },
                 .dir_image_index_built => {
                     try self.handleDirImageIndexBuilt();
@@ -300,25 +336,9 @@ const MainContext = struct {
             }
         }
 
-        if (self.image_index_iter) |image_index_iter| {
-            var casted_iter = @as(std.fs.Dir.Iterator, image_index_iter);
-            if (try casted_iter.next()) |entry| {
-                self.image_index_iter = casted_iter;
-
-                if (self.image_index_dir) |iid| {
-                    if (iid.readFile(entry.name, self.image_load_buffer)) |file_contents| {
-                        const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
-                        const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
-                        if (img_surface != null) {
-                            sdl3.SDL_DestroySurface(img_surface);
-                            try self.image_index.append(try ally.dupe(u8, entry.name));
-                        }
-                    } else |_| {}
-                }
-            } else {
-                self.image_index_iter = null;
-                try new_events.append(Event{ .dir_image_index_built = DirImageIndexBuilt{} });
-            }
+        if (self.wip_completed.isSet()) {
+            self.wip_completed.reset();
+            try new_events.append(Event{ .dir_image_index_built = DirImageIndexBuilt{} });
         }
 
         var quit = false;
@@ -602,7 +622,7 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
             const render_at = std.time.nanoTimestamp();
             std.debug.print("First render at {d}\n", .{render_at - start});
 
-            var main_context = try MainContext.init(ally, w, r, 10 * MB);
+            var main_context = try MainContext.init(ally, w, r, 20 * MB);
 
             var quit = false;
             while (!quit) {
