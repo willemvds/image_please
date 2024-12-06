@@ -20,12 +20,14 @@ const ImageLoaded = struct {
 };
 
 const EventTag = enum {
+    quit_requested,
     dir_opened,
     dir_image_index_built,
     image_loaded,
 };
 
 const Event = union(EventTag) {
+    quit_requested: void,
     dir_opened: DirOpened,
     dir_image_index_built: DirImageIndexBuilt,
     image_loaded: ImageLoaded,
@@ -237,6 +239,14 @@ const CurrentImage = struct {
     texture: *sdl3.SDL_Texture,
 };
 
+const Command = enum {
+    next_image,
+    prev_image,
+    first_image,
+    last_image,
+    quit,
+};
+
 const MainContext = struct {
     a: std.mem.Allocator,
     window: *sdl3.SDL_Window,
@@ -252,6 +262,8 @@ const MainContext = struct {
     image_index_wip: std.ArrayList([]const u8),
     wip_completed: std.Thread.ResetEvent,
 
+    keybinds: std.hash_map.AutoHashMap(u32, Command),
+
     const Self = @This();
 
     const LoopResult = struct {
@@ -266,6 +278,15 @@ const MainContext = struct {
         max_image_size: usize,
     ) !MainContext {
         const image_load_buffer = try a.alignedAlloc(u8, @alignOf(u8), max_image_size);
+        var keybinds = std.hash_map.AutoHashMap(u32, Command).init(a);
+        try keybinds.put(sdl3.SDLK_ESCAPE, Command.quit);
+        try keybinds.put(sdl3.SDLK_RIGHT, Command.next_image);
+        try keybinds.put(sdl3.SDLK_PAGEDOWN, Command.next_image);
+        try keybinds.put(sdl3.SDLK_LEFT, Command.prev_image);
+        try keybinds.put(sdl3.SDLK_PAGEUP, Command.prev_image);
+        try keybinds.put(sdl3.SDLK_HOME, Command.first_image);
+        try keybinds.put(sdl3.SDLK_END, Command.last_image);
+
         return MainContext{
             .a = a,
             .window = window,
@@ -275,6 +296,7 @@ const MainContext = struct {
             .wip_completed = std.Thread.ResetEvent{},
             .current_image = CurrentImage{ .filename = "", .texture = undefined },
             .image_load_buffer = image_load_buffer,
+            .keybinds = keybinds,
         };
     }
 
@@ -314,7 +336,42 @@ const MainContext = struct {
         self.image_index_ready = true;
     }
 
+    fn handleKeyDown(self: *Self, ev: sdl3.SDL_KeyboardEvent, new_events: *std.ArrayList(Event)) !void {
+        if (self.keybinds.get(ev.key)) |command| {
+            try self.dispatchCommand(command, new_events);
+        }
+    }
+
+    fn dispatchCommand(self: *Self, cmd: Command, new_events: *std.ArrayList(Event)) !void {
+        switch (cmd) {
+            Command.quit => {
+                try new_events.append(Event{ .quit_requested = undefined });
+            },
+            Command.next_image => {
+                if (self.loadImageAfter(self.current_image.filename)) |lev| {
+                    try new_events.*.append(lev);
+                } else |_| {}
+            },
+            Command.prev_image => {
+                if (self.loadImageBefore(self.current_image.filename)) |lev| {
+                    try new_events.*.append(lev);
+                } else |_| {}
+            },
+            Command.first_image => {
+                if (self.loadFirstImage()) |lev| {
+                    try new_events.*.append(lev);
+                } else |_| {}
+            },
+            Command.last_image => {
+                if (self.loadLastImage()) |lev| {
+                    try new_events.*.append(lev);
+                } else |_| {}
+            },
+        }
+    }
+
     fn loop(self: *Self, events: *std.ArrayListAligned(Event, null)) !LoopResult {
+        var quit = false;
         var new_events = std.ArrayList(Event).init(self.a);
 
         while (events.popOrNull()) |event| {
@@ -333,39 +390,32 @@ const MainContext = struct {
                 .dir_image_index_built => {
                     try self.handleDirImageIndexBuilt();
                 },
+                .quit_requested => {
+                    quit = true;
+                },
             }
         }
+
+        _ = sdl3.SDL_SetRenderDrawColor(self.renderer, 0, 0, 0, 0);
+        _ = sdl3.SDL_RenderClear(self.renderer);
 
         if (self.wip_completed.isSet()) {
             self.wip_completed.reset();
             try new_events.append(Event{ .dir_image_index_built = DirImageIndexBuilt{} });
         }
 
-        var quit = false;
+        //    _ = sdl3.SDL_SetRenderDrawColor(self.renderer, 0, 255, 0, 255);
+        //    _ = sdl3.SDL_RenderDebugText(self.renderer, 10, 10, "Building image index...");
+
+        try showImageTexture(self.renderer, self.current_image.texture);
+        _ = sdl3.SDL_RenderPresent(self.renderer);
+
         var e: sdl3.SDL_Event = undefined;
         while (sdl3.SDL_PollEvent(&e)) {
             if (e.type == sdl3.SDL_EVENT_QUIT) {
-                quit = true;
+                try new_events.append(Event{ .quit_requested = undefined });
             } else if (e.type == sdl3.SDL_EVENT_KEY_DOWN) {
-                if (e.key.key == sdl3.SDLK_ESCAPE) {
-                    quit = true;
-                } else if (e.key.key == sdl3.SDLK_PAGEDOWN or e.key.key == sdl3.SDLK_RIGHT) {
-                    if (self.loadImageAfter(self.current_image.filename)) |ev| {
-                        try new_events.append(ev);
-                    } else |_| {}
-                } else if (e.key.key == sdl3.SDLK_PAGEUP or e.key.key == sdl3.SDLK_LEFT) {
-                    if (self.loadImageBefore(self.current_image.filename)) |ev| {
-                        try new_events.append(ev);
-                    } else |_| {}
-                } else if (e.key.key == sdl3.SDLK_HOME) {
-                    if (self.loadFirstImage()) |ev| {
-                        try new_events.append(ev);
-                    } else |_| {}
-                } else if (e.key.key == sdl3.SDLK_END) {
-                    if (self.loadLastImage()) |ev| {
-                        try new_events.append(ev);
-                    } else |_| {}
-                }
+                try self.handleKeyDown(e.key, &new_events);
             } else if (e.type == sdl3.SDL_EVENT_WINDOW_RESIZED) {
                 const wev = e.window;
                 std.debug.print("RESIZE = {} {} {} {}\n", .{ wev.type, wev.windowID, wev.data1, wev.data2 });
@@ -377,10 +427,6 @@ const MainContext = struct {
                 std.debug.print("Render Present Result = {}\n", .{rpr});
             }
         }
-
-        _ = sdl3.SDL_RenderClear(self.renderer);
-        try showImageTexture(self.renderer, self.current_image.texture);
-        _ = sdl3.SDL_RenderPresent(self.renderer);
 
         self.frames += 1;
 
