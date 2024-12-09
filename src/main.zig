@@ -412,19 +412,24 @@ const MainContext = struct {
 
         var e: sdl3.SDL_Event = undefined;
         while (sdl3.SDL_PollEvent(&e)) {
-            if (e.type == sdl3.SDL_EVENT_QUIT) {
-                try new_events.append(Event{ .quit_requested = undefined });
-            } else if (e.type == sdl3.SDL_EVENT_KEY_DOWN) {
-                try self.handleKeyDown(e.key, &new_events);
-            } else if (e.type == sdl3.SDL_EVENT_WINDOW_RESIZED) {
-                const wev = e.window;
-                std.debug.print("RESIZE = {} {} {} {}\n", .{ wev.type, wev.windowID, wev.data1, wev.data2 });
+            switch (e.type) {
+                sdl3.SDL_EVENT_QUIT => {
+                    try new_events.append(Event{ .quit_requested = undefined });
+                },
+                sdl3.SDL_EVENT_KEY_DOWN => {
+                    try self.handleKeyDown(e.key, &new_events);
+                },
+                sdl3.SDL_EVENT_WINDOW_RESIZED => {
+                    const wev = e.window;
+                    std.debug.print("RESIZE = {} {} {} {}\n", .{ wev.type, wev.windowID, wev.data1, wev.data2 });
 
-                const rcr = sdl3.SDL_RenderClear(self.renderer);
-                std.debug.print("Render Clear Result = {}\n", .{rcr});
-                try showImageTexture(self.renderer, self.current_image.texture);
-                const rpr = sdl3.SDL_RenderPresent(self.renderer);
-                std.debug.print("Render Present Result = {}\n", .{rpr});
+                    const rcr = sdl3.SDL_RenderClear(self.renderer);
+                    std.debug.print("Render Clear Result = {}\n", .{rcr});
+                    try showImageTexture(self.renderer, self.current_image.texture);
+                    const rpr = sdl3.SDL_RenderPresent(self.renderer);
+                    std.debug.print("Render Present Result = {}\n", .{rpr});
+                },
+                else => {},
             }
         }
 
