@@ -245,6 +245,7 @@ const Command = enum {
     first_image,
     last_image,
     quit,
+    toggle_fullscreen,
 };
 
 const MainContext = struct {
@@ -261,6 +262,7 @@ const MainContext = struct {
     image_index_iter: ?std.fs.Dir.Iterator = null,
     image_index_wip: std.ArrayList([]const u8),
     wip_completed: std.Thread.ResetEvent,
+    fullscreen: bool = true,
 
     keybinds: std.hash_map.AutoHashMap(u32, Command),
 
@@ -286,6 +288,7 @@ const MainContext = struct {
         try keybinds.put(sdl3.SDLK_PAGEUP, Command.prev_image);
         try keybinds.put(sdl3.SDLK_HOME, Command.first_image);
         try keybinds.put(sdl3.SDLK_END, Command.last_image);
+        try keybinds.put(sdl3.SDLK_F11, Command.toggle_fullscreen);
 
         return MainContext{
             .a = a,
@@ -367,6 +370,9 @@ const MainContext = struct {
                     try new_events.*.append(lev);
                 } else |_| {}
             },
+            Command.toggle_fullscreen => {
+                _ = sdl3.SDL_SetWindowFullscreen(self.window, !self.fullscreen);
+            },
         }
     }
 
@@ -428,6 +434,12 @@ const MainContext = struct {
                     try showImageTexture(self.renderer, self.current_image.texture);
                     const rpr = sdl3.SDL_RenderPresent(self.renderer);
                     std.debug.print("Render Present Result = {}\n", .{rpr});
+                },
+                sdl3.SDL_EVENT_WINDOW_ENTER_FULLSCREEN => {
+                    self.fullscreen = true;
+                },
+                sdl3.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN => {
+                    self.fullscreen = false;
                 },
                 else => {},
             }
