@@ -246,6 +246,8 @@ const Command = enum {
     last_image,
     quit,
     toggle_fullscreen,
+    clipboard_copy,
+    clipboard_paste,
 };
 
 const MainContext = struct {
@@ -289,6 +291,7 @@ const MainContext = struct {
         try keybinds.put(sdl3.SDLK_HOME, Command.first_image);
         try keybinds.put(sdl3.SDLK_END, Command.last_image);
         try keybinds.put(sdl3.SDLK_F11, Command.toggle_fullscreen);
+        try keybinds.put(sdl3.SDLK_V, Command.clipboard_paste);
 
         return MainContext{
             .a = a,
@@ -373,6 +376,19 @@ const MainContext = struct {
             Command.toggle_fullscreen => {
                 _ = sdl3.SDL_SetWindowFullscreen(self.window, !self.fullscreen);
             },
+            Command.clipboard_paste => {
+                var num_available_mime_types: usize = 0;
+                const clipboard_available_mime_types = sdl3.SDL_GetClipboardMimeTypes(&num_available_mime_types);
+                if (clipboard_available_mime_types == null) {
+                    std.debug.print("CLIPBOARD FAILURE = {s}\n", .{sdl3.SDL_GetError()});
+                }
+                std.debug.print("Number of available mime types = {d}\n", .{num_available_mime_types});
+                for (0..num_available_mime_types) |idx| {
+                    std.debug.print("available mime type#{d} = {s}\n", .{ idx, clipboard_available_mime_types[idx] });
+                }
+                std.debug.print("mime types = {*}\n", .{clipboard_available_mime_types});
+            },
+            else => {},
         }
     }
 
@@ -440,6 +456,14 @@ const MainContext = struct {
                 },
                 sdl3.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN => {
                     self.fullscreen = false;
+                },
+                sdl3.SDL_EVENT_CLIPBOARD_UPDATE => {
+                    const cbev = e.clipboard;
+                    const n: usize = @intCast(cbev.n_mime_types);
+                    std.debug.print("number of mime types = {d}\n", .{cbev.n_mime_types});
+                    for (0..n) |mime_idx| {
+                        std.debug.print("available mime type #{d} = {s}\n", .{ mime_idx, cbev.mime_types[mime_idx] });
+                    }
                 },
                 else => {},
             }
