@@ -7,6 +7,7 @@ const sdl3 = @cImport({
 });
 
 const DirOpened = struct {
+    path: []const u8,
     dir: std.fs.Dir,
     iter: std.fs.Dir.Iterator,
     idx_this: []const u8 = "",
@@ -158,23 +159,55 @@ pub fn loadFirstImageFromDir(target_path: []const u8) !LoadFirstImageFromDirResu
     return LoadFirstImageFromDirResult{ .no_image_loaded = undefined };
 }
 
+const supported_image_formats = [_](*const fn (*sdl3.SDL_IOStream) callconv(.C) bool){
+    sdl3.IMG_isAVIF,
+    sdl3.IMG_isCUR,
+    sdl3.IMG_isICO,
+    sdl3.IMG_isBMP,
+    sdl3.IMG_isGIF,
+    sdl3.IMG_isJPG,
+    sdl3.IMG_isJXL,
+    sdl3.IMG_isLBM,
+    sdl3.IMG_isPCX,
+    sdl3.IMG_isPNG,
+    sdl3.IMG_isPNM,
+    sdl3.IMG_isSVG,
+    sdl3.IMG_isTIF,
+    sdl3.IMG_isXCF,
+    sdl3.IMG_isXPM,
+    sdl3.IMG_isXV,
+    sdl3.IMG_isWEBP,
+    sdl3.IMG_isQOI,
+};
+
+pub fn canLoadImage(src: []const u8) bool {
+    if (sdl3.SDL_IOFromFile(@ptrCast(src), "rb")) |iostream| {
+        for (supported_image_formats) |is_supported_image| {
+            if (is_supported_image(iostream)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 pub fn buildImageIndex(
-    dir: std.fs.Dir,
+    dir_path: []const u8,
     dir_iter: std.fs.Dir.Iterator,
     image_index: *std.ArrayList(StringSlice),
-    image_load_buffer: []u8,
     done_event: *std.Thread.ResetEvent,
 ) !void {
     var casted_iter = @as(std.fs.Dir.Iterator, dir_iter);
     while (try casted_iter.next()) |entry| {
-        if (dir.readFile(entry.name, image_load_buffer)) |file_contents| {
-            const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
-            const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
-            if (img_surface != null) {
-                sdl3.SDL_DestroySurface(img_surface);
-                try image_index.*.append(try ally.dupe(u8, entry.name));
-            }
-        } else |_| {}
+        if (entry.kind != std.fs.File.Kind.file) {
+            continue;
+        }
+        const entry_name = try ally.dupe(u8, entry.name);
+        const target = try std.fs.path.joinZ(ally, &[_][]const u8{ dir_path, entry_name });
+        if (canLoadImage(@ptrCast(target))) {
+            try image_index.*.append(entry_name);
+        }
     }
     done_event.set();
 }
@@ -319,7 +352,7 @@ const MainContext = struct {
         self.image_index_dir = ev.dir;
         self.image_index_iter = ev.iter;
 
-        const thread = try std.Thread.spawn(.{}, buildImageIndex, .{ self.image_index_dir.?, self.image_index_iter.?, &self.image_index_wip, self.image_load_buffer, &self.wip_completed });
+        const thread = try std.Thread.spawn(.{}, buildImageIndex, .{ ev.path, self.image_index_iter.?, &self.image_index_wip, &self.wip_completed });
         thread.detach();
     }
 
@@ -399,9 +432,9 @@ const MainContext = struct {
         while (events.popOrNull()) |event| {
             switch (event) {
                 .image_loaded => {
-                    _ = sdl3.SDL_RenderClear(self.renderer);
+                    //                    _ = sdl3.SDL_RenderClear(self.renderer);
                     self.handleImageLoaded(event.image_loaded);
-                    if (sdl3.SDL_RenderPresent(self.renderer) == false) return error.SDL;
+                    //                    if (sdl3.SDL_RenderPresent(self.renderer) == false) return error.SDL;
                 },
                 .dir_opened => {
                     try self.handleDirOpened(event.dir_opened);
@@ -418,7 +451,12 @@ const MainContext = struct {
             }
         }
 
-        _ = sdl3.SDL_SetRenderDrawColor(self.renderer, 0, 0, 0, 0);
+        const red = 0;
+        const green = 0;
+        const blue = 0;
+        const alpha = 0;
+
+        _ = sdl3.SDL_SetRenderDrawColor(self.renderer, red, green, blue, alpha);
         _ = sdl3.SDL_RenderClear(self.renderer);
 
         if (self.wip_completed.isSet()) {
@@ -457,14 +495,14 @@ const MainContext = struct {
                 sdl3.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN => {
                     self.fullscreen = false;
                 },
-                sdl3.SDL_EVENT_CLIPBOARD_UPDATE => {
-                    const cbev = e.clipboard;
-                    const n: usize = @intCast(cbev.n_mime_types);
-                    std.debug.print("number of mime types = {d}\n", .{cbev.n_mime_types});
-                    for (0..n) |mime_idx| {
-                        std.debug.print("available mime type #{d} = {s}\n", .{ mime_idx, cbev.mime_types[mime_idx] });
-                    }
-                },
+                //                sdl3.SDL_EVENT_CLIPBOARD_UPDATE => {
+                //                    const cbev = e.clipboard;
+                //                    const n: usize = @intCast(cbev.n_mime_types);
+                //                    std.debug.print("number of mime types = {d}\n", .{cbev.n_mime_types});
+                //                    for (0..n) |mime_idx| {
+                //                        std.debug.print("available mime type #{d} = {s}\n", .{ mime_idx, cbev.mime_types[mime_idx] });
+                //                    }
+                //                },
                 else => {},
             }
         }
@@ -675,6 +713,7 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
                 if (std.fs.path.dirname(target)) |dir_path| {
                     const dh = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
                     try events.append(Event{ .dir_opened = DirOpened{
+                        .path = target,
                         .dir = dh,
                         .iter = dh.iterate(),
                         .idx_this = "",
@@ -692,6 +731,7 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
                                 const tex = try textureFromSurface(r, image_loaded_result.img_surface);
                                 try events.append(Event{ .image_loaded = ImageLoaded{ .filename = image_loaded_result.img_file_name, .texture = tex } });
                                 try events.append(Event{ .dir_opened = DirOpened{
+                                    .path = target,
                                     .dir = image_loaded_result.dir_handle,
                                     .iter = image_loaded_result.dir_it,
                                     .idx_this = try ally.dupe(u8, image_loaded_result.img_file_name),
