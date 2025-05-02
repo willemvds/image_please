@@ -34,8 +34,6 @@ const Event = union(EventTag) {
     image_loaded: ImageLoaded,
 };
 
-const StringSlice = []const u8;
-
 const SDL_CLOSE_IO = true;
 const SDL_NO_CLOSE_IO = false;
 
@@ -195,7 +193,7 @@ pub fn canLoadImage(src: []const u8) bool {
 pub fn buildImageIndex(
     dir_path: []const u8,
     dir_iter: std.fs.Dir.Iterator,
-    image_index: *std.ArrayList(StringSlice),
+    image_index: *std.ArrayList([]const u8),
     done_event: *std.Thread.ResetEvent,
 ) !void {
     var casted_iter = @as(std.fs.Dir.Iterator, dir_iter);
@@ -268,7 +266,7 @@ pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !v
 const EventList = std.ArrayList(Event);
 
 const CurrentImage = struct {
-    filename: StringSlice = "",
+    filename: []const u8 = "",
     texture: *sdl3.SDL_Texture,
 };
 
@@ -362,7 +360,7 @@ const MainContext = struct {
 
         self.image_index.deinit();
         self.image_index = self.image_index_wip;
-        self.image_index_wip = std.ArrayList(StringSlice).init(self.a);
+        self.image_index_wip = std.ArrayList([]const u8).init(self.a);
 
         std.mem.sort([]const u8, self.image_index.items, c, ziglyph.Collator.ascending);
         for (self.image_index.items, 0..) |iname, idx| {
@@ -520,6 +518,10 @@ const MainContext = struct {
             return error.IMAGE_INDEX_NOT_READY;
         }
 
+        if (self.image_index.items.len == 0) {
+            return error.IMAGE_INDEX_EMPTY;
+        }
+
         const idx = 0;
         //std.sort.binarySearch([]const u8, name, self.image_index.items, name, ziglyph.Collator.ascending);
 
@@ -545,6 +547,10 @@ const MainContext = struct {
     fn loadLastImage(self: *Self) !Event {
         if (self.image_index_ready == false) {
             return error.IMAGE_INDEX_NOT_READY;
+        }
+
+        if (self.image_index.items.len == 0) {
+            return error.IMAGE_INDEX_EMPTY;
         }
 
         const idx = self.image_index.items.len - 1;
@@ -573,6 +579,11 @@ const MainContext = struct {
         if (self.image_index_ready == false) {
             return error.IMAGE_INDEX_NOT_READY;
         }
+
+        if (self.image_index.items.len == 0) {
+            return error.IMAGE_INDEX_EMPTY;
+        }
+
         _ = name;
         const idx = self.current_image_idx;
         //std.sort.binarySearch([]const u8, name, self.image_index.items, name, ziglyph.Collator.ascending);
@@ -601,6 +612,10 @@ const MainContext = struct {
     fn loadImageAfter(self: *Self, name: []const u8) !Event {
         if (self.image_index_ready == false) {
             return error.IMAGE_INDEX_NOT_READY;
+        }
+
+        if (self.image_index.items.len == 0) {
+            return error.IMAGE_INDEX_EMPTY;
         }
 
         _ = name;
