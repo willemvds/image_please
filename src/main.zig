@@ -1,5 +1,5 @@
 const std = @import("std");
-const ziglyph = @import("ziglyph");
+//const ziglyph = @import("ziglyph");
 const sdl3 = @cImport({
     @cInclude("SDL3/SDL.h");
     //    @cInclude("SDL3/SDL_main.h");
@@ -10,7 +10,7 @@ const DirOpened = struct {
     path: []const u8,
     dir: std.fs.Dir,
     iter: std.fs.Dir.Iterator,
-    idx_this: []const u8 = "",
+    load_first_image: bool = false,
 };
 
 const DirImageIndexBuilt = struct {};
@@ -20,11 +20,16 @@ const ImageLoaded = struct {
     texture: *sdl3.SDL_Texture,
 };
 
+const LoadImageQueued = struct {
+    filename: []const u8,
+};
+
 const EventTag = enum {
     quit_requested,
     dir_opened,
     dir_image_index_built,
     image_loaded,
+    load_image_queued,
 };
 
 const Event = union(EventTag) {
@@ -32,6 +37,7 @@ const Event = union(EventTag) {
     dir_opened: DirOpened,
     dir_image_index_built: DirImageIndexBuilt,
     image_loaded: ImageLoaded,
+    load_image_queued: LoadImageQueued,
 };
 
 const SDL_CLOSE_IO = true;
@@ -66,8 +72,6 @@ pub fn main() !void {
 // process here is the noun (the instance of the app) not the verb (like do_x)
 fn processArgs(a: std.mem.Allocator) !std.ArrayList([]const u8) {
     var process_args = std.ArrayList([]const u8).init(a);
-
-    std.debug.print("{?}\n", .{@TypeOf(a)});
     var arg_it = try std.process.argsWithAllocator(a);
     while (arg_it.next()) |arg| {
         try process_args.append(arg);
@@ -126,37 +130,6 @@ const LoadFirstImageFromDirImageLoaded = struct {
     dir_it: std.fs.Dir.Iterator,
 };
 
-pub fn loadFirstImageFromDir(target_path: []const u8) !LoadFirstImageFromDirResult {
-    std.debug.print("target_path = {s}\n", .{target_path});
-
-    const dd = try std.fs.openDirAbsolute(target_path, .{ .iterate = true });
-
-    var it = dd.iterate();
-    while (try it.next()) |dir_entry| {
-        if (dir_entry.kind != std.fs.File.Kind.file) {
-            continue;
-        }
-        if (dd.readFileAlloc(ally, dir_entry.name, 10 * MB)) |file_contents| {
-            const contents_sdl = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
-            const img_surface = sdl3.IMG_Load_IO(contents_sdl, SDL_CLOSE_IO);
-            if (img_surface != null) {
-                return LoadFirstImageFromDirResult{ .image_loaded = LoadFirstImageFromDirImageLoaded{
-                    .img_surface = img_surface,
-                    .img_file_name = try ally.dupe(u8, dir_entry.name),
-                    .dir_handle = dd,
-                    .dir_it = it,
-                } };
-            } else {
-                std.debug.print("NOT AN IMAGE {s}\n", .{dir_entry.name});
-            }
-        } else |err| {
-            std.debug.print("^err = {?}\n", .{err});
-            continue;
-        }
-    }
-    return LoadFirstImageFromDirResult{ .no_image_loaded = undefined };
-}
-
 const supported_image_formats = [_](*const fn (*sdl3.SDL_IOStream) callconv(.C) bool){
     sdl3.IMG_isAVIF,
     sdl3.IMG_isCUR,
@@ -190,13 +163,162 @@ pub fn canLoadImage(src: []const u8) bool {
     return false;
 }
 
+const LoadImageWorkerResultKind = enum {
+    empty,
+    ok,
+    err,
+};
+
+const LoadImageWorkerResult = struct {
+    kind: LoadImageWorkerResultKind,
+    path: []const u8,
+    surface: ?*sdl3.SDL_Surface = null,
+    err: anyerror = error.notset,
+
+    fn init(path: []const u8) !*LoadImageWorkerResult {
+        const r = try ally.create(LoadImageWorkerResult);
+        r.kind = LoadImageWorkerResultKind.empty;
+        r.path = path;
+        r.surface = null;
+        r.err = error.notset;
+        return r;
+    }
+};
+
+const LoadImageWorker = struct {
+    dir: std.fs.Dir,
+    mu: std.Thread.Mutex = std.Thread.Mutex{},
+    cond: std.Thread.Condition = std.Thread.Condition{},
+    work_completed_event: std.Thread.ResetEvent = std.Thread.ResetEvent{},
+
+    read_buffer: []u8,
+
+    has_work_waiting: bool = false,
+
+    wip_path: []const u8 = "",
+    has_wip: bool = false,
+    result: *LoadImageWorkerResult,
+
+    const Self = @This();
+
+    fn init(
+        a: std.mem.Allocator,
+        dir: std.fs.Dir,
+        max_image_size: usize,
+    ) !*LoadImageWorker {
+        var loadImageWorker = try a.create(LoadImageWorker);
+        loadImageWorker.read_buffer = try a.alignedAlloc(u8, @alignOf(u8), max_image_size);
+        loadImageWorker.dir = dir;
+        loadImageWorker.mu = std.Thread.Mutex{};
+        loadImageWorker.cond = std.Thread.Condition{};
+        loadImageWorker.work_completed_event = std.Thread.ResetEvent{};
+        loadImageWorker.has_work_waiting = false;
+        loadImageWorker.wip_path = "";
+        loadImageWorker.has_wip = false;
+        loadImageWorker.result = try LoadImageWorkerResult.init("");
+        return loadImageWorker;
+    }
+
+    fn start(self: *Self) !void {
+        const load_image_thread = try std.Thread.spawn(.{}, loadImageThreadWorker, .{self});
+        load_image_thread.detach();
+    }
+
+    fn queue(self: *Self, path: []const u8) !void {
+        if (self.has_work_waiting == true) {
+            return;
+            //            return error.WorkInProgress;
+        }
+
+        {
+            self.wip_path = path;
+            self.mu.lock();
+            self.has_work_waiting = true;
+            self.mu.unlock();
+        }
+
+        self.cond.signal();
+    }
+
+    fn last_result(self: *Self) !*LoadImageWorkerResult {
+        if (self.work_completed_event.isSet()) {
+            self.has_work_waiting = false;
+            const result = self.result;
+            self.result = try LoadImageWorkerResult.init("");
+            self.work_completed_event.reset();
+            return result;
+        }
+
+        return error.NOT_READY;
+    }
+};
+
+pub fn loadImageThreadWorker(
+    worker: *LoadImageWorker,
+) !void {
+    while (true) {
+        worker.mu.lock();
+        defer worker.mu.unlock();
+        while (worker.has_work_waiting == false) {
+            worker.cond.wait(&worker.mu);
+        }
+        defer worker.work_completed_event.set();
+
+        worker.result.path = worker.wip_path;
+        if (worker.dir.readFile(worker.wip_path, worker.read_buffer)) |file_contents| {
+            const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
+            const img_surface = sdl3.IMG_Load_IO(contents_io, false);
+            if (img_surface != null) {
+                worker.result.kind = LoadImageWorkerResultKind.ok;
+                worker.result.surface = img_surface;
+            } else {
+                worker.result.kind = LoadImageWorkerResultKind.err;
+                worker.result.err = error.SDL;
+                std.debug.print("Some sort of file parsing error = {s}\n", .{sdl3.SDL_GetError()});
+            }
+        } else |err| {
+            worker.result.kind = LoadImageWorkerResultKind.err;
+            worker.result.err = err;
+        }
+        worker.has_work_waiting = false;
+    }
+}
+
+const ImageCache = struct {
+    a: std.mem.Allocator,
+    textures: std.StringHashMap(*sdl3.SDL_Texture),
+
+    const Self = @This();
+
+    fn init(
+        a: std.mem.Allocator,
+    ) ImageCache {
+        const textures = std.StringHashMap(*sdl3.SDL_Texture).init(a);
+        return ImageCache{
+            .a = a,
+            .textures = textures,
+        };
+    }
+
+    fn put(self: *Self, path: []const u8, texture: *sdl3.SDL_Texture) !void {
+        try self.textures.put(path, texture);
+    }
+
+    fn get(self: *Self, path: []const u8) ?*sdl3.SDL_Texture {
+        return self.textures.get(path);
+    }
+};
+
 pub fn buildImageIndex(
     dir_path: []const u8,
     dir_iter: std.fs.Dir.Iterator,
     image_index: *std.ArrayList([]const u8),
     done_event: *std.Thread.ResetEvent,
+    queue_load_first: bool,
+    load_image_worker: *LoadImageWorker,
 ) !void {
     var casted_iter = @as(std.fs.Dir.Iterator, dir_iter);
+    var load_first_queued = false;
     while (try casted_iter.next()) |entry| {
         if (entry.kind != std.fs.File.Kind.file) {
             continue;
@@ -205,6 +327,10 @@ pub fn buildImageIndex(
         const target = try std.fs.path.joinZ(ally, &[_][]const u8{ dir_path, entry_name });
         if (canLoadImage(@ptrCast(target))) {
             try image_index.*.append(entry_name);
+            if (queue_load_first and !load_first_queued) {
+                try load_image_worker.queue(entry_name);
+                load_first_queued = true;
+            }
         }
     }
     done_event.set();
@@ -214,8 +340,6 @@ pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !v
     var w: c_int = 0;
     var h: c_int = 0;
     _ = sdl3.SDL_GetCurrentRenderOutputSize(renderer, &w, &h);
-    //    std.debug.print("rendering w,h = {}, {}\n", .{ w, h });
-    //    std.debug.print("tex w,h = {}, {}\n", .{ tex.w, tex.h });
     if ((tex.w > w) or (tex.h > h)) {
         const wf = @as(f32, @floatFromInt(w));
         const hf = @as(f32, @floatFromInt(h));
@@ -243,7 +367,6 @@ pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !v
         };
 
         _ = sdl3.SDL_RenderTexture(renderer, tex, null, &dst_rect);
-        //std.debug.print("render(scaled) result = {}\n", .{rr});
     } else {
         const wf = @as(f32, @floatFromInt(w));
         const hf = @as(f32, @floatFromInt(h));
@@ -259,7 +382,6 @@ pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !v
         };
 
         _ = sdl3.SDL_RenderTexture(renderer, tex, null, &dst_rect);
-        //std.debug.print("render result = {}\n", .{rr});
     }
 }
 
@@ -270,7 +392,14 @@ const CurrentImage = struct {
     texture: *sdl3.SDL_Texture,
 };
 
+const PendingImageStage = enum {
+    display,
+    cache_next,
+    cache_prev,
+};
+
 const Command = enum {
+    none,
     next_image,
     prev_image,
     first_image,
@@ -288,16 +417,23 @@ const MainContext = struct {
     frames: u64 = 0,
     current_image: CurrentImage,
     current_image_idx: usize = 0,
+    pending_image_index: usize = 0,
+    pending_image_stage: PendingImageStage,
     image_load_buffer: []u8,
     image_index_ready: bool = false,
     image_index: std.ArrayList([]const u8),
     image_index_dir: ?std.fs.Dir = null,
     image_index_iter: ?std.fs.Dir.Iterator = null,
     image_index_wip: std.ArrayList([]const u8),
+    image_cache: ImageCache,
     wip_completed: std.Thread.ResetEvent,
     fullscreen: bool = true,
+    command_in_progress: Command = Command.none,
+
+    load_image_worker: *LoadImageWorker,
 
     keybinds: std.hash_map.AutoHashMap(u32, Command),
+    show_image: bool = false,
 
     const Self = @This();
 
@@ -310,6 +446,7 @@ const MainContext = struct {
         a: std.mem.Allocator,
         window: *sdl3.SDL_Window,
         renderer: *sdl3.SDL_Renderer,
+        load_image_worker: *LoadImageWorker,
         max_image_size: usize,
     ) !MainContext {
         const image_load_buffer = try a.alignedAlloc(u8, @alignOf(u8), max_image_size);
@@ -330,39 +467,63 @@ const MainContext = struct {
             .renderer = renderer,
             .image_index = std.ArrayList([]const u8).init(a),
             .image_index_wip = std.ArrayList([]const u8).init(a),
+            .image_cache = ImageCache.init(a),
             .wip_completed = std.Thread.ResetEvent{},
             .current_image = CurrentImage{ .filename = "", .texture = undefined },
+            .pending_image_stage = PendingImageStage.display,
             .image_load_buffer = image_load_buffer,
+            .load_image_worker = load_image_worker,
             .keybinds = keybinds,
+            .show_image = false,
         };
     }
 
-    fn handleImageLoaded(self: *Self, ev: ImageLoaded) void {
-        sdl3.SDL_DestroyTexture(self.current_image.texture);
-        self.current_image = CurrentImage{
-            .filename = ev.filename,
-            .texture = ev.texture,
-        };
-        try showImageTexture(self.renderer, ev.texture);
+    fn handleImageLoaded(self: *Self, ev: ImageLoaded) !void {
+        try self.image_cache.put(ev.filename, ev.texture);
+        switch (self.pending_image_stage) {
+            PendingImageStage.display => {
+                self.show_image = true;
+                self.current_image_idx = self.pending_image_index;
+                self.current_image = CurrentImage{
+                    .filename = ev.filename,
+                    .texture = ev.texture,
+                };
+                try showImageTexture(self.renderer, ev.texture);
+
+                self.pending_image_stage = PendingImageStage.cache_next;
+                if (self.loadNextImage()) |_| {} else |_| {}
+            },
+            PendingImageStage.cache_next => {
+                std.debug.print("@@@$$$ Cached Image Load = {s}\n", .{ev.filename});
+            },
+            PendingImageStage.cache_prev => {},
+        }
     }
 
     fn handleDirOpened(self: *Self, ev: DirOpened) !void {
         self.image_index_dir = ev.dir;
         self.image_index_iter = ev.iter;
 
-        const thread = try std.Thread.spawn(.{}, buildImageIndex, .{ ev.path, self.image_index_iter.?, &self.image_index_wip, &self.wip_completed });
+        const thread = try std.Thread.spawn(.{}, buildImageIndex, .{
+            ev.path,
+            self.image_index_iter.?,
+            &self.image_index_wip,
+            &self.wip_completed,
+            ev.load_first_image,
+            self.load_image_worker,
+        });
         thread.detach();
     }
 
     fn handleDirImageIndexBuilt(self: *Self) !void {
-        var c = try ziglyph.Collator.init(self.a);
-        defer c.deinit();
+        //        var c = try ziglyph.Collator.init(self.a);
+        //        defer c.deinit();
 
         self.image_index.deinit();
         self.image_index = self.image_index_wip;
         self.image_index_wip = std.ArrayList([]const u8).init(self.a);
 
-        std.mem.sort([]const u8, self.image_index.items, c, ziglyph.Collator.ascending);
+        //        std.mem.sort([]const u8, self.image_index.items, c, ziglyph.Collator.ascending);
         for (self.image_index.items, 0..) |iname, idx| {
             std.debug.print("idx {d} = {s}\n", .{ idx, iname });
             if (std.mem.eql(u8, iname, self.current_image.filename)) {
@@ -385,39 +546,31 @@ const MainContext = struct {
                 try new_events.append(Event{ .quit_requested = undefined });
             },
             Command.next_image => {
-                if (self.loadImageAfter(self.current_image.filename)) |lev| {
+                if (self.loadNextImage()) |lev| {
+                    self.pending_image_stage = PendingImageStage.display;
                     try new_events.*.append(lev);
                 } else |_| {}
             },
             Command.prev_image => {
-                if (self.loadImageBefore(self.current_image.filename)) |lev| {
+                if (self.loadPreviousImage()) |lev| {
+                    self.pending_image_stage = PendingImageStage.display;
                     try new_events.*.append(lev);
                 } else |_| {}
             },
             Command.first_image => {
                 if (self.loadFirstImage()) |lev| {
+                    self.pending_image_stage = PendingImageStage.display;
                     try new_events.*.append(lev);
                 } else |_| {}
             },
             Command.last_image => {
                 if (self.loadLastImage()) |lev| {
+                    self.pending_image_stage = PendingImageStage.display;
                     try new_events.*.append(lev);
                 } else |_| {}
             },
             Command.toggle_fullscreen => {
                 _ = sdl3.SDL_SetWindowFullscreen(self.window, !self.fullscreen);
-            },
-            Command.clipboard_paste => {
-                var num_available_mime_types: usize = 0;
-                const clipboard_available_mime_types = sdl3.SDL_GetClipboardMimeTypes(&num_available_mime_types);
-                if (clipboard_available_mime_types == null) {
-                    std.debug.print("CLIPBOARD FAILURE = {s}\n", .{sdl3.SDL_GetError()});
-                }
-                std.debug.print("Number of available mime types = {d}\n", .{num_available_mime_types});
-                for (0..num_available_mime_types) |idx| {
-                    std.debug.print("available mime type#{d} = {s}\n", .{ idx, clipboard_available_mime_types[idx] });
-                }
-                std.debug.print("mime types = {*}\n", .{clipboard_available_mime_types});
             },
             else => {},
         }
@@ -427,18 +580,14 @@ const MainContext = struct {
         var quit = false;
         var new_events = std.ArrayList(Event).init(self.a);
 
-        while (events.popOrNull()) |event| {
+        while (events.pop()) |event| {
             switch (event) {
                 .image_loaded => {
-                    //                    _ = sdl3.SDL_RenderClear(self.renderer);
-                    self.handleImageLoaded(event.image_loaded);
-                    //                    if (sdl3.SDL_RenderPresent(self.renderer) == false) return error.SDL;
+                    try self.handleImageLoaded(event.image_loaded);
                 },
+                .load_image_queued => {},
                 .dir_opened => {
                     try self.handleDirOpened(event.dir_opened);
-                    //if (event.dir_opened.idx_this.len > 0) {
-                    //    try self.image_index.append(event.dir_opened.idx_this);
-                    //}
                 },
                 .dir_image_index_built => {
                     try self.handleDirImageIndexBuilt();
@@ -462,10 +611,19 @@ const MainContext = struct {
             try new_events.append(Event{ .dir_image_index_built = DirImageIndexBuilt{} });
         }
 
-        //    _ = sdl3.SDL_SetRenderDrawColor(self.renderer, 0, 255, 0, 255);
-        //    _ = sdl3.SDL_RenderDebugText(self.renderer, 10, 10, "Building image index...");
+        if (self.load_image_worker.last_result()) |result| {
+            if (result.kind == LoadImageWorkerResultKind.ok) {
+                if (result.surface) |surface| {
+                    const tex = try textureFromSurface(self.renderer, surface);
+                    sdl3.SDL_DestroySurface(result.surface);
+                    try new_events.append(Event{ .image_loaded = ImageLoaded{ .filename = result.path, .texture = tex } });
+                }
+            }
+        } else |_| {}
 
-        try showImageTexture(self.renderer, self.current_image.texture);
+        if (self.show_image) {
+            try showImageTexture(self.renderer, self.current_image.texture);
+        }
         _ = sdl3.SDL_RenderPresent(self.renderer);
 
         var e: sdl3.SDL_Event = undefined;
@@ -480,12 +638,6 @@ const MainContext = struct {
                 sdl3.SDL_EVENT_WINDOW_RESIZED => {
                     const wev = e.window;
                     std.debug.print("RESIZE = {} {} {} {}\n", .{ wev.type, wev.windowID, wev.data1, wev.data2 });
-
-                    const rcr = sdl3.SDL_RenderClear(self.renderer);
-                    std.debug.print("Render Clear Result = {}\n", .{rcr});
-                    try showImageTexture(self.renderer, self.current_image.texture);
-                    const rpr = sdl3.SDL_RenderPresent(self.renderer);
-                    std.debug.print("Render Present Result = {}\n", .{rpr});
                 },
                 sdl3.SDL_EVENT_WINDOW_ENTER_FULLSCREEN => {
                     self.fullscreen = true;
@@ -493,14 +645,6 @@ const MainContext = struct {
                 sdl3.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN => {
                     self.fullscreen = false;
                 },
-                //                sdl3.SDL_EVENT_CLIPBOARD_UPDATE => {
-                //                    const cbev = e.clipboard;
-                //                    const n: usize = @intCast(cbev.n_mime_types);
-                //                    std.debug.print("number of mime types = {d}\n", .{cbev.n_mime_types});
-                //                    for (0..n) |mime_idx| {
-                //                        std.debug.print("available mime type #{d} = {s}\n", .{ mime_idx, cbev.mime_types[mime_idx] });
-                //                    }
-                //                },
                 else => {},
             }
         }
@@ -513,7 +657,16 @@ const MainContext = struct {
         };
     }
 
-    fn loadFirstImage(self: *Self) !Event {
+    fn loadImage(self: *Self, path: []const u8) !Event {
+        if (self.image_cache.get(path)) |tex| {
+            return Event{ .image_loaded = ImageLoaded{ .filename = path, .texture = tex } };
+        } else {
+            try self.load_image_worker.queue(path);
+            return Event{ .load_image_queued = LoadImageQueued{ .filename = path } };
+        }
+    }
+
+    fn checkIndex(self: *Self) !void {
         if (self.image_index_ready == false) {
             return error.IMAGE_INDEX_NOT_READY;
         }
@@ -521,129 +674,93 @@ const MainContext = struct {
         if (self.image_index.items.len == 0) {
             return error.IMAGE_INDEX_EMPTY;
         }
+    }
 
-        const idx = 0;
-        //std.sort.binarySearch([]const u8, name, self.image_index.items, name, ziglyph.Collator.ascending);
+    fn loadFirstImage(self: *Self) !Event {
+        try self.checkIndex();
+        self.pending_image_index = 0;
 
-        const indexed_name = self.image_index.items[idx];
-        std.debug.print("-- (first) want to load {d} {s}\n", .{ idx, indexed_name });
-
-        if (self.image_index_dir) |iid| {
-            if (iid.readFile(indexed_name, self.image_load_buffer)) |file_contents| {
-                const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
-                const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
-                if (img_surface != null) {
-                    const texture = try textureFromSurface(self.renderer, img_surface);
-                    sdl3.SDL_DestroySurface(img_surface);
-                    self.current_image_idx = idx;
-                    return Event{ .image_loaded = ImageLoaded{ .filename = indexed_name, .texture = texture } };
-                }
-            } else |_| {}
-        }
-
-        return error.AWWELL;
+        return try self.loadImage(self.image_index.items[self.pending_image_index]);
     }
 
     fn loadLastImage(self: *Self) !Event {
-        if (self.image_index_ready == false) {
-            return error.IMAGE_INDEX_NOT_READY;
-        }
+        try self.checkIndex();
+        self.pending_image_index = self.image_index.items.len - 1;
 
-        if (self.image_index.items.len == 0) {
-            return error.IMAGE_INDEX_EMPTY;
-        }
-
-        const idx = self.image_index.items.len - 1;
-        //std.sort.binarySearch([]const u8, name, self.image_index.items, name, ziglyph.Collator.ascending);
-
-        const indexed_name = self.image_index.items[idx];
-        std.debug.print("-- (last) want to load {d} {s}\n", .{ idx, indexed_name });
-
-        if (self.image_index_dir) |iid| {
-            if (iid.readFile(indexed_name, self.image_load_buffer)) |file_contents| {
-                const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
-                const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
-                if (img_surface != null) {
-                    const texture = try textureFromSurface(self.renderer, img_surface);
-                    sdl3.SDL_DestroySurface(img_surface);
-                    self.current_image_idx = idx;
-                    return Event{ .image_loaded = ImageLoaded{ .filename = indexed_name, .texture = texture } };
-                }
-            } else |_| {}
-        }
-
-        return error.AWWELL;
+        return try self.loadImage(self.image_index.items[self.pending_image_index]);
     }
 
-    fn loadImageBefore(self: *Self, name: []const u8) !Event {
-        if (self.image_index_ready == false) {
-            return error.IMAGE_INDEX_NOT_READY;
-        }
+    fn loadPreviousImage(self: *Self) !Event {
+        try self.checkIndex();
 
-        if (self.image_index.items.len == 0) {
-            return error.IMAGE_INDEX_EMPTY;
-        }
-
-        _ = name;
         const idx = self.current_image_idx;
-        //std.sort.binarySearch([]const u8, name, self.image_index.items, name, ziglyph.Collator.ascending);
-
         if (idx > 0) {
-            const indexed_name = self.image_index.items[idx - 1];
-            std.debug.print("-- (before) want to load {d} {s}\n", .{ idx - 1, indexed_name });
-
-            if (self.image_index_dir) |iid| {
-                if (iid.readFile(indexed_name, self.image_load_buffer)) |file_contents| {
-                    const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
-                    const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
-                    if (img_surface != null) {
-                        const texture = try textureFromSurface(self.renderer, img_surface);
-                        sdl3.SDL_DestroySurface(img_surface);
-                        self.current_image_idx = idx - 1;
-                        return Event{ .image_loaded = ImageLoaded{ .filename = indexed_name, .texture = texture } };
-                    }
-                } else |_| {}
-            }
+            self.pending_image_index = idx - 1;
+            return try self.loadImage(self.image_index.items[self.pending_image_index]);
         }
 
-        return error.AWWELL;
+        return error.AwWell;
     }
 
-    fn loadImageAfter(self: *Self, name: []const u8) !Event {
-        if (self.image_index_ready == false) {
-            return error.IMAGE_INDEX_NOT_READY;
-        }
-
-        if (self.image_index.items.len == 0) {
-            return error.IMAGE_INDEX_EMPTY;
-        }
-
-        _ = name;
+    fn loadNextImage(self: *Self) !Event {
+        try self.checkIndex();
         const idx = self.current_image_idx;
-
         if (idx < self.image_index.items.len - 1) {
-            const indexed_name = self.image_index.items[idx + 1];
-            std.debug.print("-- (after) want to load {d} {s}\n", .{ idx + 1, indexed_name });
-
-            if (self.image_index_dir) |iid| {
-                if (iid.readFile(indexed_name, self.image_load_buffer)) |file_contents| {
-                    const contents_io = sdl3.SDL_IOFromConstMem(@ptrCast(file_contents), file_contents.len);
-                    const img_surface = sdl3.IMG_Load_IO(contents_io, SDL_CLOSE_IO);
-                    if (img_surface != null) {
-                        const texture = try textureFromSurface(self.renderer, img_surface);
-                        sdl3.SDL_DestroySurface(img_surface);
-                        self.current_image_idx = idx + 1;
-                        return Event{ .image_loaded = ImageLoaded{ .filename = indexed_name, .texture = texture } };
-                    }
-                } else |_| {}
-            }
+            self.pending_image_index = idx + 1;
+            return try self.loadImage(self.image_index.items[self.pending_image_index]);
         }
 
-        return error.AWWELL;
+        return error.AwWell;
     }
 };
 
-pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
+const MainEntryMode = enum {
+    cwd,
+    dir,
+    file,
+};
+
+const createWindowAndRendererResult = struct {
+    window: *sdl3.SDL_Window,
+    renderer: *sdl3.SDL_Renderer,
+};
+
+fn createWindowAndRenderer(
+    window_title: [*c]const u8,
+    window_w: c_int,
+    window_h: c_int,
+    window_flags: u64,
+) !createWindowAndRendererResult {
+    var window: ?*sdl3.SDL_Window = undefined;
+    var renderer: ?*sdl3.SDL_Renderer = undefined;
+
+    if (!sdl3.SDL_CreateWindowAndRenderer(
+        window_title,
+        window_w,
+        window_h,
+        window_flags,
+        &window,
+        &renderer,
+    )) {
+        return error.SDL;
+    }
+
+    if (window) |w| {
+        if (renderer) |r| {
+            return createWindowAndRendererResult{
+                .window = w,
+                .renderer = r,
+            };
+        }
+    }
+
+    unreachable();
+}
+
+pub fn gfxpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
+    var events = std.ArrayList(Event).init(ally);
+    defer events.deinit();
+
     const process_args = try processArgs(ally);
     const starting_wd_path = try std.fs.cwd().realpathAlloc(ally, ".");
 
@@ -656,6 +773,58 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
         } else {
             target = try std.fs.path.join(ally, &[_][]const u8{ starting_wd_path, user_provided_path });
         }
+    }
+
+    var entry_mode = MainEntryMode.cwd;
+
+    const target_handle = try std.fs.openFileAbsolute(target, .{});
+    const target_metadata = try target_handle.metadata();
+    var dir: std.fs.Dir = undefined;
+    switch (target_metadata.kind()) {
+        std.fs.File.Kind.file => {
+            entry_mode = MainEntryMode.file;
+            if (std.fs.path.dirname(target)) |dir_path| {
+                dir = try std.fs.openDirAbsolute(dir_path, .{});
+
+                const dir_with_iter = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
+                const it = dir_with_iter.iterate();
+                const ev = Event{ .dir_opened = DirOpened{
+                    .path = dir_path,
+                    .dir = dir_with_iter,
+                    .iter = it,
+                } };
+                try events.append(ev);
+            } else {
+                return error.FAILED_TO_GET_PATH_WE_SUCK_ETC;
+            }
+        },
+        std.fs.File.Kind.directory => {
+            entry_mode = MainEntryMode.dir;
+            dir = try std.fs.openDirAbsolute(target, .{});
+        },
+        else => {
+            std.debug.print("Unexpected file kind = {}\n", .{target_metadata.kind()});
+            return error.UnexpectedFileKind;
+        },
+    }
+
+    var load_image_worker = try LoadImageWorker.init(ally, dir, 30 * MB);
+    try load_image_worker.start();
+
+    if (entry_mode == MainEntryMode.file) {
+        try load_image_worker.queue(target);
+
+        //        try load_image_worker.queue("what2");
+    } else {
+        const dir_with_iter = try std.fs.openDirAbsolute(target, .{ .iterate = true });
+        const it = dir_with_iter.iterate();
+        const ev = Event{ .dir_opened = DirOpened{
+            .path = target,
+            .dir = dir_with_iter,
+            .iter = it,
+            .load_first_image = true,
+        } };
+        try events.append(ev);
     }
 
     if (sdl3.SDL_Init(sdl3.SDL_INIT_VIDEO) == false) {
@@ -681,7 +850,6 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
     }
     const window_title = "gfxpls";
     const window_flags =
-
         //sdl3.SDL_WINDOW_TRANSPARENT |
         sdl3.SDL_WINDOW_BORDERLESS |
         sdl3.SDL_WINDOW_FULLSCREEN |
@@ -689,90 +857,34 @@ pub fn gfxpls_main(start: @TypeOf(std.time.nanoTimestamp())) !void {
         sdl3.SDL_WINDOW_INPUT_FOCUS |
         sdl3.SDL_WINDOW_RESIZABLE;
 
-    var window: ?*sdl3.SDL_Window = undefined;
-    var renderer: ?*sdl3.SDL_Renderer = undefined;
-
-    if (!sdl3.SDL_CreateWindowAndRenderer(
+    const windowAndRendererResult = try createWindowAndRenderer(
         window_title,
         window_w,
         window_h,
         window_flags,
-        &window,
-        &renderer,
-    )) {
-        return error.SDL;
-    }
+    );
 
-    // SDL_GetDisplayForWindow
-    //
     //const stdout_file = std.io.getStdOut().writer();
     //var bw = std.io.bufferedWriter(stdout_file);
     //const stdout = bw.writer();
 
-    var events = std.ArrayList(Event).init(ally);
-    defer events.deinit();
+    std.debug.print("renderer = {}\n", .{windowAndRendererResult.renderer});
 
-    if (window) |w| {
-        if (renderer) |r| {
-            std.debug.print("renderer = {}\n", .{r});
+    std.debug.print(">> DisplayContentScale={}\n", .{sdl3.SDL_GetDisplayContentScale(1)});
+    std.debug.print(">> WindowDisplayScale={}\n", .{sdl3.SDL_GetWindowDisplayScale(windowAndRendererResult.window)});
+    var main_context = try MainContext.init(
+        ally,
+        windowAndRendererResult.window,
+        windowAndRendererResult.renderer,
+        load_image_worker,
+        30 * MB,
+    );
 
-            std.debug.print(">> DisplayContentScale={}\n", .{sdl3.SDL_GetDisplayContentScale(1)});
-            std.debug.print(">> WindowDisplayScale={}\n", .{sdl3.SDL_GetWindowDisplayScale(w)});
-            if (loadImageTextureFromFile(r, target)) |tex| {
-                const filename = std.fs.path.basename(target);
-                try events.append(Event{ .image_loaded = ImageLoaded{
-                    .filename = filename,
-                    .texture = tex,
-                } });
-
-                if (std.fs.path.dirname(target)) |dir_path| {
-                    const dh = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
-                    try events.append(Event{ .dir_opened = DirOpened{
-                        .path = target,
-                        .dir = dh,
-                        .iter = dh.iterate(),
-                        .idx_this = "",
-                    } });
-                } else {
-                    std.debug.print("How can we have a loaded image but not get the dir?\n", .{});
-                }
-            } else |err| {
-                switch (err) {
-                    error.IsDir, error.SDL => {
-                        const load_first_result = try loadFirstImageFromDir(target);
-                        switch (load_first_result) {
-                            .image_loaded => {
-                                const image_loaded_result = load_first_result.image_loaded;
-                                const tex = try textureFromSurface(r, image_loaded_result.img_surface);
-                                try events.append(Event{ .image_loaded = ImageLoaded{ .filename = image_loaded_result.img_file_name, .texture = tex } });
-                                try events.append(Event{ .dir_opened = DirOpened{
-                                    .path = target,
-                                    .dir = image_loaded_result.dir_handle,
-                                    .iter = image_loaded_result.dir_it,
-                                    .idx_this = try ally.dupe(u8, image_loaded_result.img_file_name),
-                                } });
-                            },
-                            .no_image_loaded => {},
-                        }
-                    },
-                    else => {
-                        return err;
-                    },
-                }
-            }
-
-            const render_at = std.time.nanoTimestamp();
-            std.debug.print("First render at {d}\n", .{render_at - start});
-
-            var main_context = try MainContext.init(ally, w, r, 20 * MB);
-
-            var quit = false;
-            while (!quit) {
-                const loop_result = try main_context.loop(&events);
-                quit = loop_result.quit;
-                events.deinit();
-                events = loop_result.events;
-            }
-        }
+    var quit = false;
+    while (!quit) {
+        const loop_result = try main_context.loop(&events);
+        quit = loop_result.quit;
+        events.deinit();
+        events = loop_result.events;
     }
 }

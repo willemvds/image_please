@@ -15,10 +15,10 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    const ziglyph = b.dependency("ziglyph", .{
-        .optimize = optimize,
-        .target = target,
-    });
+//    const ziglyph = b.dependency("ziglyph", .{
+//        .optimize = optimize,
+//        .target = target,
+//    });
 
     const exe = b.addExecutable(.{
         .name = "gfxpls",
@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("SDL3");
     exe.linkSystemLibrary("SDL3_image");
 
-    exe.root_module.addImport("ziglyph", ziglyph.module("ziglyph"));
+//    exe.root_module.addImport("ziglyph", ziglyph.module("ziglyph"));
 
     //    exe.addRPath(b.path("/usr/local/lib"));
 
