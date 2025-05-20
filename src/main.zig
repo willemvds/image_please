@@ -183,7 +183,6 @@ const ImageCache = struct {
 
 pub fn buildImageIndex(
     dir_path: []const u8,
-    //    dir_iter: std.fs.Dir.Iterator,
     image_index: *std.ArrayList([]const u8),
     done_event: *std.Thread.ResetEvent,
     queue_load_first: bool,
@@ -304,23 +303,16 @@ const MainContext = struct {
     renderer: *sdl3.SDL_Renderer,
     frames: u64 = 0,
     current_image: CurrentImage,
-    current_image_idx: usize = 0,
     current_image_index_slot: usize = 0,
-    pending_image_index: usize = 0,
-    pending_image_index_slot: usize = 0,
 
     pending_image_tasks: std.ArrayList(PendingImageTask),
 
     read_file_worker: *ReadFileWorker,
 
-    image_load_buffer: []u8,
     image_index_ready: bool = false,
     image_index: std.ArrayList([]const u8),
-    image_index_dir: ?std.fs.Dir = null,
-    image_index_iter: ?std.fs.Dir.Iterator = null,
     image_index_wip: std.ArrayList([]const u8),
     image_cache: ImageCache,
-    wanted_image_path: []const u8 = "",
     wip_completed: *std.Thread.ResetEvent,
     fullscreen: bool = true,
     command_in_progress: Command = Command.none,
@@ -328,11 +320,9 @@ const MainContext = struct {
 
     showing_image_texture: ?*sdl3.SDL_Texture,
 
-    //    load_image_worker: *LoadImageWorker,
     next_worker_task: []const u8 = "",
 
     keybinds: std.hash_map.AutoHashMap(u32, Command),
-    show_image: bool = false,
     view_mode: ViewMode = ViewMode.init(),
 
     labels: std.ArrayList(ViewChunk),
@@ -371,11 +361,9 @@ const MainContext = struct {
         window: *sdl3.SDL_Window,
         renderer: *sdl3.SDL_Renderer,
         read_file_worker: *ReadFileWorker,
-        max_image_size: usize,
         image_index_completed_event: *std.Thread.ResetEvent,
         image_index_wip: std.ArrayList([]const u8),
     ) !MainContext {
-        const image_load_buffer = try a.alignedAlloc(u8, @alignOf(u8), max_image_size);
         var keybinds = std.hash_map.AutoHashMap(u32, Command).init(a);
         try keybinds.put(sdl3.SDLK_ESCAPE, Command.quit);
         try keybinds.put(sdl3.SDLK_RIGHT, Command.next_image);
@@ -404,13 +392,10 @@ const MainContext = struct {
             .wip_completed = image_index_completed_event,
             .current_image = CurrentImage{ .filename = "", .texture = undefined },
             .showing_image_texture = null,
-            .image_load_buffer = image_load_buffer,
             .read_file_worker = read_file_worker,
             .keybinds = keybinds,
-            .show_image = false,
             .labels = std.ArrayList(ViewChunk).init(a),
             .pending_image_tasks = std.ArrayList(PendingImageTask).init(a),
-            //            .parse_image_worker_pool = parse_image_worker_pool,
         };
     }
 
@@ -497,7 +482,7 @@ const MainContext = struct {
             for (self.image_index.items, 0..) |iname, idx| {
                 std.debug.print("idx {d} = {s}\n", .{ idx, iname });
                 if (std.mem.eql(u8, iname, self.current_image.filename)) {
-                    self.current_image_idx = idx;
+                    self.current_image_index_slot = idx;
                 }
             }
 
@@ -629,10 +614,8 @@ const MainContext = struct {
     }
 
     fn nameless(self: *Self, filename: []const u8) !NamelessResult {
-        //        const filename = self.image_index.items[slot];
         if (self.image_cache.get(filename)) |cached_texture| {
             self.showing_image_texture = cached_texture;
-            self.show_image = true;
             self.current_image = CurrentImage{
                 .filename = filename,
                 .texture = cached_texture,
@@ -642,7 +625,6 @@ const MainContext = struct {
             if (self.read_file_worker.queue(filename)) |_| {
                 return NamelessResult.queued;
             } else |_| {
-                //            self.pending_image_index_slot = slot;
                 return NamelessResult.worker_busy;
             }
         }
@@ -658,7 +640,6 @@ const MainContext = struct {
                 //                self.current_image_index_slot = slot;
             },
             NamelessResult.queued => {
-                self.pending_image_index_slot = slot;
                 self.view_mode = ViewMode{ .waiting_for_image = slot };
             },
             NamelessResult.worker_busy => {
@@ -875,7 +856,6 @@ pub fn gfxpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
         windowAndRendererResult.window,
         windowAndRendererResult.renderer,
         read_file_worker,
-        30 * MB,
         &image_index_work_completed_event,
         starting_image_index,
     );
