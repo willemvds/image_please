@@ -747,16 +747,6 @@ pub fn gfxpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
             if (std.fs.path.dirname(target)) |path| {
                 dir_path = path;
                 dir = try std.fs.openDirAbsolute(dir_path, .{});
-
-                //                const dir_with_iter = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
-                //                const it = dir_with_iter.iterate();
-                //                const ev = Event{ .dir_opened = DirOpened{
-                //                    .path = dir_path,
-                //                    .dir = dir_with_iter,
-                //                    .iter = it,
-                //                } };
-                //                try events.append(ev);
-
             } else {
                 return error.FAILED_TO_GET_PATH_WE_SUCK_ETC;
             }
@@ -775,7 +765,10 @@ pub fn gfxpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
     const read_file_worker = try ReadFileWorker.init(ally, dir);
 
     var load_first_image = false;
-    if (entry_mode == MainEntryMode.file) {} else {
+    if (entry_mode == MainEntryMode.file) {
+        const filename = std.fs.path.basename(target);
+        try read_file_worker.queue(filename);
+    } else {
         load_first_image = true;
     }
 
