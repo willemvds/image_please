@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
     //    exe.addLibraryPath(b.path("/usr/local/lib"));
     exe.linkSystemLibrary("SDL3");
     exe.linkSystemLibrary("SDL3_image");
+    exe.linkSystemLibrary("SDL3_ttf");
 
 //    exe.root_module.addImport("ziglyph", ziglyph.module("ziglyph"));
 
