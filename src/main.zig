@@ -379,6 +379,7 @@ const MainContext = struct {
         try parse_image_worker_pool.init(.{
             .allocator = std.heap.page_allocator,
             .n_jobs = n_parse_threads,
+            .stack_size = 200 * KB,
         });
         std.debug.print("number of parse threads = {d}\n", .{n_parse_threads});
 
