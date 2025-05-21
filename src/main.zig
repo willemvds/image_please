@@ -783,6 +783,8 @@ fn createWindowAndRenderer(
     unreachable();
 }
 
+const font_file = @embedFile("embed/SauceCodeProNerdFontMono-Regular.ttf");
+
 var font: *sdl3.TTF_Font = undefined;
 
 pub fn gfxpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
@@ -858,7 +860,8 @@ pub fn gfxpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
         return error.SDL;
     }
 
-    if (sdl3.TTF_OpenFont("/usr/share/fonts/SauceCodeProNerdFontMono-Regular.ttf", 32)) |f| {
+    const font_file_io = sdl3.SDL_IOFromConstMem(font_file, font_file.len);
+    if (sdl3.TTF_OpenFontIO(font_file_io, SDL_CLOSE_IO, 32)) |f| {
         font = f;
     } else {
         return error.SDL;
