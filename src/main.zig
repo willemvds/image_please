@@ -443,7 +443,14 @@ const MainContext = struct {
                 const task = self.pending_image_tasks.items[idx];
                 self.pending_image_tasks.items[idx].completed_event.reset();
 
+                const create_texture_started_at = try std.time.Instant.now();
                 const image_texture = sdl3.SDL_CreateTextureFromSurface(self.renderer, self.pending_image_tasks.items[idx].result.ok);
+                const create_texture_completed_at = try std.time.Instant.now();
+                std.debug.print("[handleParseImageWorker@frame#{d}] Created new texture for {s}, ns={d}\n", .{
+                    self.frames,
+                    task.filename,
+                    create_texture_completed_at.since(create_texture_started_at),
+                });
                 sdl3.SDL_DestroySurface(self.pending_image_tasks.items[idx].result.ok);
                 if (image_texture == null) {
                     std.debug.print("[handleParseImageWorker] CreateTexture failed = {s}\n", .{sdl3.SDL_GetError()});
@@ -567,6 +574,8 @@ const MainContext = struct {
     }
 
     fn loop(self: *Self, events: *std.ArrayListAligned(Event, null)) !LoopResult {
+        const frame_budget = 8 * Millisecond;
+        const frame_started_at = std.time.nanoTimestamp();
         self.view_changed = false;
         var quit = false;
         var new_events = std.ArrayList(Event).init(self.a);
@@ -627,9 +636,27 @@ const MainContext = struct {
             _ = sdl3.SDL_RenderPresent(self.renderer);
         }
 
-        self.frames += 1;
+        const frame_completed_at = std.time.nanoTimestamp();
+        const frame_cost = frame_completed_at - frame_started_at;
 
-        std.time.sleep(1 * Millisecond);
+        const remaining_frame_budget = frame_budget - frame_cost;
+        if (remaining_frame_budget > 0) {
+            //            std.debug.print("Frame took {d}/{d}, sleeping for {d}\n", .{
+            //                frame_cost,
+            //                frame_budget,
+            //                remaining_frame_budget,
+            //            });
+            std.time.sleep(@as(u64, @intCast(remaining_frame_budget)));
+        } else {
+            std.debug.print("Frame#{d} went over budget {d}/{d}, view_changed?={any}\n", .{
+                self.frames,
+                frame_cost,
+                frame_budget,
+                self.view_changed,
+            });
+        }
+
+        self.frames += 1;
 
         return LoopResult{
             .events = new_events,
