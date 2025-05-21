@@ -15,6 +15,7 @@ task: *Task,
 task_waiting: bool,
 task_completed_event: std.Thread.ResetEvent,
 task_result: *Result,
+ready: bool = true,
 
 const Task = struct {
     filename: []const u8,
@@ -52,6 +53,7 @@ pub fn init(
     dir: std.fs.Dir,
 ) !*ReadFileWorker {
     const worker = try a.create(ReadFileWorker);
+    worker.ready = true;
     worker.a = a;
     worker.dir = dir;
     worker.mu = std.Thread.Mutex{};
@@ -59,6 +61,7 @@ pub fn init(
     worker.task = try Task.init(a, "");
     worker.task_waiting = false;
     worker.task_completed_event = std.Thread.ResetEvent{};
+    worker.task_completed_event.reset();
     worker.task_result = try Result.init(a);
 
     const file_reader_thread = try std.Thread.spawn(.{}, readFileWorkerThread, .{ worker, a });
@@ -68,26 +71,34 @@ pub fn init(
 }
 
 pub fn queue(self: *ReadFileWorker, path: []const u8) !void {
-    if (self.task_waiting == true) {
+    if (!self.ready) {
         return Error.TaskInProgress;
     }
-    self.task.filename = path;
+    self.task_completed_event.reset();
+    self.ready = false;
     self.mu.lock();
+    self.task.filename = path;
     self.task_waiting = true;
     self.mu.unlock();
     self.cond.signal();
 }
 
-pub fn last_result(self: *ReadFileWorker) !*Result {
-    if (self.task_completed_event.isSet()) {
+pub fn lastResult(self: *ReadFileWorker) !*Result {
+    const completed = self.task_completed_event.isSet();
+    if (completed) {
         const result = self.task_result;
         self.task = try Task.init(self.a, "");
+        self.ready = true;
+
         self.task_completed_event.reset();
-        self.task_waiting = false;
         return result;
     }
 
     return Error.ResultNotReady;
+}
+
+pub fn isBusy(self: *ReadFileWorker) bool {
+    return !self.ready;
 }
 
 fn readFile(worker: *ReadFileWorker) ![]const u8 {
@@ -100,6 +111,7 @@ fn readFile(worker: *ReadFileWorker) ![]const u8 {
 fn readFileWorkerThread(worker: *ReadFileWorker, a: std.mem.Allocator) !void {
     while (true) {
         worker.mu.lock();
+        defer worker.mu.unlock();
         while (worker.task_waiting == false) {
             worker.cond.wait(&worker.mu);
         }
@@ -117,6 +129,5 @@ fn readFileWorkerThread(worker: *ReadFileWorker, a: std.mem.Allocator) !void {
 
         worker.task_waiting = false;
         worker.task_completed_event.set();
-        worker.mu.unlock();
     }
 }

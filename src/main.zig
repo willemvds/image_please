@@ -26,6 +26,11 @@ const KB = 1000 * BYTE;
 const MB = 1000 * KB;
 const GB = 1000 * MB;
 
+const Nanosecond = 1;
+const Microsecond = 1000 * Nanosecond;
+const Millisecond = 1000 * Microsecond;
+const Second = 1000 * Millisecond;
+
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 var ally = gpa.allocator();
 
@@ -437,18 +442,30 @@ const MainContext = struct {
             if (self.pending_image_tasks.items[idx].completed_event.isSet()) {
                 const task = self.pending_image_tasks.items[idx];
                 self.pending_image_tasks.items[idx].completed_event.reset();
-                self.view_mode = ViewMode{ .showing_image = 0 };
-                self.view_changed = true;
-                self.showing_image_texture = sdl3.SDL_CreateTextureFromSurface(self.renderer, self.pending_image_tasks.items[idx].result.ok);
 
+                const image_texture = sdl3.SDL_CreateTextureFromSurface(self.renderer, self.pending_image_tasks.items[idx].result.ok);
                 sdl3.SDL_DestroySurface(self.pending_image_tasks.items[idx].result.ok);
-                try self.image_cache.put(task.filename, self.showing_image_texture.?);
+                if (image_texture == null) {
+                    std.debug.print("[handleParseImageWorker] CreateTexture failed = {s}\n", .{sdl3.SDL_GetError()});
+                    continue;
+                }
+                try self.image_cache.put(task.filename, image_texture);
+
+                if (std.mem.eql(u8, task.filename, self.image_index.items[self.current_image_index_slot])) {
+                    self.view_mode = ViewMode{ .showing_image = self.current_image_index_slot };
+                    self.view_changed = true;
+                    self.showing_image_texture = image_texture;
+                }
+
+                if (std.mem.eql(u8, self.image_index.items[self.preload_index], self.pending_image_tasks.items[idx].filename)) {
+                    self.preload_index = 0;
+                }
             }
         }
     }
 
     fn handleReadFileWorker(self: *Self) !void {
-        if (self.read_file_worker.last_result()) |result| {
+        if (self.read_file_worker.lastResult()) |result| {
             if (result.kind == ReadFileWorker.Result.Kind.ok) {
                 const re = try self.a.create(std.Thread.ResetEvent);
                 const task = PendingImageTask{
@@ -488,6 +505,21 @@ const MainContext = struct {
             }
 
             self.image_index_ready = true;
+        }
+    }
+
+    fn checkForPreloading(self: *Self) !void {
+        if (!self.read_file_worker.isBusy() and self.preload_index == 0) {
+            const maybe_preload_index = self.current_image_index_slot + 1;
+            if (maybe_preload_index < self.image_index.items.len) {
+                const filename = self.image_index.items[maybe_preload_index];
+                if (self.image_cache.contains(filename)) {
+                    return;
+                }
+                self.preload_index = maybe_preload_index;
+                std.debug.print("[checkForPreloading] Decided to preload filename={s}\n", .{filename});
+                try self.read_file_worker.queue(filename);
+            }
         }
     }
 
@@ -566,6 +598,8 @@ const MainContext = struct {
             }
         }
 
+        try self.checkForPreloading();
+
         for (events.items) |event| {
             switch (event) {
                 .quit_requested => {
@@ -594,6 +628,9 @@ const MainContext = struct {
         }
 
         self.frames += 1;
+
+        std.time.sleep(1 * Millisecond);
+
         return LoopResult{
             .events = new_events,
             .quit = quit,
@@ -638,18 +675,21 @@ const MainContext = struct {
         const r = try self.nameless(filename);
         switch (r) {
             NamelessResult.done => {
-                //                self.current_image_index_slot = slot;
+                self.view_mode = ViewMode{ .showing_image = slot };
             },
             NamelessResult.queued => {
                 self.view_mode = ViewMode{ .waiting_for_image = slot };
             },
             NamelessResult.worker_busy => {
                 self.next_worker_task = filename;
-
                 self.view_mode = ViewMode{ .waiting_for_image = slot };
             },
         }
         self.current_image_index_slot = slot;
+        std.debug.print("[changeImageToSlot] Should be viewing/waiting for slot #{d} filename={s}\n", .{
+            self.current_image_index_slot,
+            self.image_index.items[self.current_image_index_slot],
+        });
     }
 
     fn firstImage(self: *Self) !void {
