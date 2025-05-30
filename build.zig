@@ -15,11 +15,6 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-//    const ziglyph = b.dependency("ziglyph", .{
-//        .optimize = optimize,
-//        .target = target,
-//    });
-
     const exe = b.addExecutable(.{
         .name = "gfxpls",
         // In this case the main source file is merely a path, however, in more

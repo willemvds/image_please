@@ -2,7 +2,6 @@ const std = @import("std");
 
 const ReadFileWorker = @import("ReadFileWorker.zig");
 
-//const ziglyph = @import("ziglyph");
 const sdl3 = @cImport({
     @cInclude("SDL3/SDL.h");
     //    @cInclude("SDL3/SDL_main.h");
