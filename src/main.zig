@@ -222,7 +222,12 @@ pub fn buildImageIndex(
 pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !void {
     var w: c_int = 0;
     var h: c_int = 0;
+    //    const render_size_started_at = try std.time.Instant.now();
     _ = sdl3.SDL_GetCurrentRenderOutputSize(renderer, &w, &h);
+    //    const render_size_completed_at = try std.time.Instant.now();
+    //    std.debug.print("Get render output size took ns={d}\n", .{
+    //        render_size_completed_at.since(render_size_started_at),
+    //    });
     if ((tex.w > w) or (tex.h > h)) {
         const wf = @as(f32, @floatFromInt(w));
         const hf = @as(f32, @floatFromInt(h));
@@ -287,6 +292,21 @@ const Command = enum {
     clipboard_paste,
 };
 
+fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    var lhs_lower = ally.alloc(u8, lhs.len) catch {
+        return false;
+    };
+    defer ally.free(lhs_lower);
+    var rhs_lower = ally.alloc(u8, rhs.len) catch {
+        return false;
+    };
+    defer ally.free(rhs_lower);
+    lhs_lower = std.ascii.lowerString(lhs_lower, lhs);
+    rhs_lower = std.ascii.lowerString(rhs_lower, rhs);
+
+    return std.mem.order(u8, lhs_lower, rhs_lower) == .lt;
+}
+
 var parse_image_worker_pool: std.Thread.Pool = undefined;
 var image_index_work_completed_event: std.Thread.ResetEvent = std.Thread.ResetEvent{};
 var starting_image_index: std.ArrayList([]const u8) = undefined;
@@ -331,7 +351,7 @@ const MainContext = struct {
     view_mode: ViewMode = ViewMode.init(),
 
     labels: std.ArrayList(ViewChunk),
-    view_changed: bool = false,
+    view_changed: bool = true,
 
     const Self = @This();
 
@@ -458,7 +478,7 @@ const MainContext = struct {
                 }
                 try self.image_cache.put(task.filename, image_texture);
 
-                if (std.mem.eql(u8, task.filename, self.image_index.items[self.current_image_index_slot])) {
+                if (self.showing_image_texture == null or std.mem.eql(u8, task.filename, self.image_index.items[self.current_image_index_slot])) {
                     self.view_mode = ViewMode{ .showing_image = self.current_image_index_slot };
                     self.view_changed = true;
                     self.showing_image_texture = image_texture;
@@ -503,11 +523,12 @@ const MainContext = struct {
             self.image_index = self.image_index_wip;
             self.image_index_wip = std.ArrayList([]const u8).init(self.a);
 
-            //        std.mem.sort([]const u8, self.image_index.items, c, ziglyph.Collator.ascending);
+            std.mem.sort([]const u8, self.image_index.items, {}, stringLessThan);
             for (self.image_index.items, 0..) |iname, idx| {
                 std.debug.print("idx {d} = {s}\n", .{ idx, iname });
                 if (std.mem.eql(u8, iname, self.current_image.filename)) {
                     self.current_image_index_slot = idx;
+                    self.view_changed = true;
                 }
             }
 
@@ -627,7 +648,12 @@ const MainContext = struct {
             _ = sdl3.SDL_RenderClear(self.renderer);
 
             self.labels.clearRetainingCapacity();
+            //            const build_view_started_at = try std.time.Instant.now();
             try self.buildView();
+            //            const build_view_completed_at = try std.time.Instant.now();
+            //            std.debug.print("[buildView] took ns={d}\n", .{
+            //                build_view_completed_at.since(build_view_started_at),
+            //            });
 
             for (self.labels.items) |label| {
                 _ = sdl3.SDL_RenderTexture(self.renderer, label.texture, null, &label.dst_rect);
