@@ -35,7 +35,7 @@ var ally = gpa.allocator();
 
 pub fn main() !void {
     const start = std.time.nanoTimestamp();
-    gfxpls_main(start) catch |err| {
+    imgpls_main(start) catch |err| {
         switch (err) {
             error.SDL => {
                 std.debug.print("exit err = {s}\n", .{sdl3.SDL_GetError()});
@@ -48,7 +48,7 @@ pub fn main() !void {
     const end = std.time.nanoTimestamp();
     const runtimeNano = end - start;
     const runtimeSec = @as(f64, @floatFromInt(runtimeNano)) / 1000 / 1000 / 1000;
-    std.debug.print("gfxpls ran for {d}s\n", .{runtimeSec});
+    std.debug.print("ImagePlease ran for {d}s\n", .{runtimeSec});
 }
 
 // process here is the noun (the instance of the app) not the verb (like do_x)
@@ -812,7 +812,7 @@ const font_file = @embedFile("embed/SauceCodeProNerdFontMono-Regular.ttf");
 
 var font: *sdl3.TTF_Font = undefined;
 
-pub fn gfxpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
+pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
     var events = std.ArrayList(Event).init(ally);
     defer events.deinit();
 
@@ -912,7 +912,7 @@ pub fn gfxpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
     } else {
         std.debug.print("sdl err = {s}\n", .{sdl3.SDL_GetError()});
     }
-    const window_title = "gfxpls";
+    const window_title = "ImagePlease";
     const window_flags =
         //sdl3.SDL_WINDOW_TRANSPARENT |
         sdl3.SDL_WINDOW_BORDERLESS |

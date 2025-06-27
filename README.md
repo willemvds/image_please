@@ -1,5 +1,5 @@
-# gfxpls
-Graphics, Please!
+# ImagePlease
+Image, Please!
 
 ## Roadmap
 - Load image from cmdline args.
