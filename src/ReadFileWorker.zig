@@ -104,8 +104,10 @@ pub fn isBusy(self: *ReadFileWorker) bool {
 fn readFile(worker: *ReadFileWorker) ![]const u8 {
     const file = try worker.dir.openFile(worker.task.filename, .{});
     const stat = try file.stat();
-    const contents = try file.readToEndAllocOptions(worker.a, stat.size, stat.size, @alignOf(u8), null);
-    return contents;
+    const buffer: []u8 = try worker.a.alloc(u8, stat.size);
+    const bytes_read = try file.read(buffer);
+    std.debug.assert(bytes_read == stat.size);
+    return buffer;
 }
 
 fn readFileWorkerThread(worker: *ReadFileWorker, a: std.mem.Allocator) !void {

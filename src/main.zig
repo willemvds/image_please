@@ -14,7 +14,8 @@ const EventTag = enum {
 };
 
 const Event = union(EventTag) {
-    quit_requested: void,
+    // https://github.com/ziglang/zig/issues/24886
+    quit_requested: bool,
 };
 
 const SDL_CLOSE_IO = true;
@@ -41,7 +42,7 @@ pub fn main() !void {
                 std.debug.print("exit err = {s}\n", .{sdl3.SDL_GetError()});
             },
             else => {
-                std.debug.print("exit err = {!}\n", .{err});
+                std.debug.print("exit err = {any}\n", .{err});
             },
         }
     };
@@ -53,10 +54,10 @@ pub fn main() !void {
 
 // process here is the noun (the instance of the app) not the verb (like do_x)
 fn processArgs(a: std.mem.Allocator) !std.ArrayList([]const u8) {
-    var process_args = std.ArrayList([]const u8).init(a);
+    var process_args: std.ArrayList([]const u8) = .empty;
     var arg_it = try std.process.argsWithAllocator(a);
     while (arg_it.next()) |arg| {
-        try process_args.append(arg);
+        try process_args.append(a, arg);
     }
 
     return process_args;
@@ -89,7 +90,7 @@ const LoadFirstImageFromDirImageLoaded = struct {
     dir_it: std.fs.Dir.Iterator,
 };
 
-const supported_image_formats = [_](*const fn (*sdl3.SDL_IOStream) callconv(.C) bool){
+const supported_image_formats = [_](*const fn (*sdl3.SDL_IOStream) callconv(.c) bool){
     sdl3.IMG_isAVIF,
     sdl3.IMG_isCUR,
     sdl3.IMG_isICO,
@@ -206,7 +207,7 @@ pub fn buildImageIndex(
         defer ally.free(target);
         if (canLoadImage(target)) {
             const entry_name = try ally.dupe(u8, entry.name);
-            try image_index.*.append(entry_name);
+            try image_index.*.append(ally, entry_name);
             if (queue_load_first and !load_first_queued) {
                 try read_file_worker.queue(entry_name);
                 load_first_queued = true;
@@ -411,7 +412,7 @@ const MainContext = struct {
             .a = a,
             .window = window,
             .renderer = renderer,
-            .image_index = std.ArrayList([]const u8).init(a),
+            .image_index = .empty,
             .image_index_wip = image_index_wip,
             .image_cache = ImageCache.init(a),
             .wip_completed = image_index_completed_event,
@@ -419,8 +420,8 @@ const MainContext = struct {
             .showing_image_texture = null,
             .read_file_worker = read_file_worker,
             .keybinds = keybinds,
-            .labels = std.ArrayList(ViewChunk).init(a),
-            .pending_image_tasks = std.ArrayList(PendingImageTask).init(a),
+            .labels = .empty,
+            .pending_image_tasks = .empty,
         };
     }
 
@@ -435,7 +436,7 @@ const MainContext = struct {
     fn dispatchCommand(self: *Self, cmd: Command, new_events: *std.ArrayList(Event)) !void {
         switch (cmd) {
             Command.quit => {
-                try new_events.append(Event{ .quit_requested = undefined });
+                try new_events.append(ally, Event{ .quit_requested = undefined });
             },
             Command.next_image => {
                 try self.nextImage();
@@ -463,6 +464,7 @@ const MainContext = struct {
                 self.pending_image_tasks.items[idx].completed_event.reset();
 
                 const create_texture_started_at = try std.time.Instant.now();
+                // TODO(@willemvds): Handle error case.
                 const image_texture = sdl3.SDL_CreateTextureFromSurface(self.renderer, self.pending_image_tasks.items[idx].result.ok);
                 const create_texture_completed_at = try std.time.Instant.now();
                 std.debug.print("[handleParseImageWorker@frame#{d}] Created new texture for {s}, ns={d}\n", .{
@@ -505,7 +507,7 @@ const MainContext = struct {
                     task.result,
                     task.completed_event,
                 });
-                try self.pending_image_tasks.append(task);
+                try self.pending_image_tasks.append(ally, task);
             }
             if (self.next_worker_task.len > 0) {
                 try self.read_file_worker.queue(self.next_worker_task);
@@ -518,9 +520,9 @@ const MainContext = struct {
         if (self.wip_completed.isSet()) {
             self.wip_completed.reset();
 
-            self.image_index.deinit();
+            self.image_index.deinit(ally);
             self.image_index = self.image_index_wip;
-            self.image_index_wip = std.ArrayList([]const u8).init(self.a);
+            self.image_index_wip = .empty;
 
             std.mem.sort([]const u8, self.image_index.items, {}, stringLessThan);
             for (self.image_index.items, 0..) |iname, idx| {
@@ -598,7 +600,7 @@ const MainContext = struct {
         const frame_started_at = std.time.nanoTimestamp();
         self.view_changed = false;
         var quit = false;
-        var new_events = std.ArrayList(Event).init(self.a);
+        var new_events: std.ArrayList(Event) = .empty;
 
         self.handleImageIndexWorker();
         try self.handleReadFileWorker();
@@ -608,7 +610,7 @@ const MainContext = struct {
         while (sdl3.SDL_PollEvent(&e)) {
             switch (e.type) {
                 sdl3.SDL_EVENT_QUIT => {
-                    try new_events.append(Event{ .quit_requested = undefined });
+                    try new_events.append(ally, Event{ .quit_requested = undefined });
                 },
                 sdl3.SDL_EVENT_KEY_DOWN => {
                     try self.handleKeyDown(e.key, &new_events);
@@ -671,7 +673,7 @@ const MainContext = struct {
             //                frame_budget,
             //                remaining_frame_budget,
             //            });
-            std.time.sleep(@as(u64, @intCast(remaining_frame_budget)));
+            std.Thread.sleep(@as(u64, @intCast(remaining_frame_budget)));
         } else {
             std.debug.print("Frame#{d} went over budget {d}/{d}, view_changed?={any}\n", .{
                 self.frames,
@@ -813,8 +815,8 @@ const font_file = @embedFile("embed/SauceCodeProNerdFontMono-Regular.ttf");
 var font: *sdl3.TTF_Font = undefined;
 
 pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
-    var events = std.ArrayList(Event).init(ally);
-    defer events.deinit();
+    var events: std.ArrayList(Event) = .empty; 
+    defer events.deinit(ally);
 
     const process_args = try processArgs(ally);
     const starting_wd_path = try std.fs.cwd().realpathAlloc(ally, ".");
@@ -833,10 +835,10 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
     var entry_mode = MainEntryMode.cwd;
 
     const target_handle = try std.fs.openFileAbsolute(target, .{});
-    const target_metadata = try target_handle.metadata();
+    const target_metadata = try target_handle.stat();
     var dir: std.fs.Dir = undefined;
     var dir_path: []const u8 = "";
-    switch (target_metadata.kind()) {
+    switch (target_metadata.kind) {
         std.fs.File.Kind.file => {
             entry_mode = MainEntryMode.file;
             if (std.fs.path.dirname(target)) |path| {
@@ -852,7 +854,7 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
             dir = try std.fs.openDirAbsolute(target, .{});
         },
         else => {
-            std.debug.print("Unexpected file kind = {}\n", .{target_metadata.kind()});
+            std.debug.print("Unexpected file kind = {}\n", .{target_metadata.kind});
             return error.UnexpectedFileKind;
         },
     }
@@ -867,7 +869,7 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
         load_first_image = true;
     }
 
-    starting_image_index = std.ArrayList([]const u8).init(ally);
+    starting_image_index = .empty;
     const thread = try std.Thread.spawn(.{}, buildImageIndex, .{
         dir_path,
         &starting_image_index,
@@ -953,7 +955,7 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
     while (!quit) {
         const loop_result = try main_context.loop(&events);
         quit = loop_result.quit;
-        events.deinit();
+        events.deinit(ally);
         events = loop_result.events;
     }
 }
