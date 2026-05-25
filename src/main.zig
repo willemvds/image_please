@@ -31,12 +31,17 @@ const Microsecond = 1000 * Nanosecond;
 const Millisecond = 1000 * Microsecond;
 const Second = 1000 * Millisecond;
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var gpa = std.heap.DebugAllocator(.{}){};
 var ally = gpa.allocator();
 
-pub fn main() !void {
-    const start = std.time.nanoTimestamp();
-    imgpls_main(start) catch |err| {
+pub fn main(init: std.process.Init) !void {
+    //var threaded_io: std.Io.Threaded = .init_single_threaded;
+    //const io = threaded_io.io();
+    //defer threaded_io.deinit();
+
+    const ts = std.Io.Clock.now(.awake, init.io);
+    const start = ts.toNanoseconds();
+    imgpls_main(init, start) catch |err| {
         switch (err) {
             error.SDL => {
                 std.debug.print("exit err = {s}\n", .{sdl3.SDL_GetError()});
@@ -46,18 +51,18 @@ pub fn main() !void {
             },
         }
     };
-    const end = std.time.nanoTimestamp();
+    const end = std.Io.Clock.awake.now(init.io).toNanoseconds();
     const runtimeNano = end - start;
     const runtimeSec = @as(f64, @floatFromInt(runtimeNano)) / 1000 / 1000 / 1000;
     std.debug.print("ImagePlease ran for {d}s\n", .{runtimeSec});
 }
 
 // process here is the noun (the instance of the app) not the verb (like do_x)
-fn processArgs(a: std.mem.Allocator) !std.ArrayList([]const u8) {
+fn processArgs(init: std.process.Init) !std.ArrayList([]const u8) {
     var process_args: std.ArrayList([]const u8) = .empty;
-    var arg_it = try std.process.argsWithAllocator(a);
+    var arg_it = init.minimal.args.iterate();
     while (arg_it.next()) |arg| {
-        try process_args.append(a, arg);
+        try process_args.append(init.gpa, arg);
     }
 
     return process_args;
@@ -139,10 +144,11 @@ const ParseImageResult = union(ParseImageResultTag) {
 };
 
 pub fn parseImage(
+    io: std.Io,
     filename: []const u8,
     content: []const u8,
     result: *ParseImageResult,
-    done_event: *std.Thread.ResetEvent,
+    done_event: *std.Io.Event,
 ) void {
     const content_io = sdl3.SDL_IOFromConstMem(@ptrCast(content), content.len);
     const img_surface = sdl3.IMG_Load_IO(content_io, SDL_CLOSE_IO);
@@ -154,7 +160,7 @@ pub fn parseImage(
         std.debug.print("image load FAILED {s}={s}\n", .{ filename, sdl3.SDL_GetError() });
         result.* = ParseImageResult{ .err = error.sdl_temp };
     }
-    done_event.set();
+    done_event.set(io);
 }
 
 const ImageCache = struct {
@@ -187,20 +193,21 @@ const ImageCache = struct {
 };
 
 pub fn buildImageIndex(
+    io: std.Io,
     dir_path: []const u8,
     image_index: *std.ArrayList([]const u8),
-    done_event: *std.Thread.ResetEvent,
+    done_event: *std.Io.Event,
     queue_load_first: bool,
     read_file_worker: *ReadFileWorker,
 ) !void {
-    const started_at = try std.time.Instant.now();
+    const started_at = std.Io.Clock.awake.now(io);
 
-    const dir_with_iter = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
+    const dir_with_iter = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
     var iter = dir_with_iter.iterate();
 
     var load_first_queued = false;
-    while (try iter.next()) |entry| {
-        if (entry.kind != std.fs.File.Kind.file) {
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != std.Io.File.Kind.file) {
             continue;
         }
         const target = try std.fs.path.joinZ(ally, &[_][]const u8{ dir_path, entry.name });
@@ -214,17 +221,17 @@ pub fn buildImageIndex(
             }
         }
     }
-    const completed_at = try std.time.Instant.now();
-    done_event.set();
-    std.debug.print("buildImageIndex #images={d} ns={d}\n", .{ image_index.items.len, completed_at.since(started_at) });
+    const completed_at = std.Io.Clock.awake.now(io);
+    done_event.set(io);
+    std.debug.print("buildImageIndex #images={d} ns={}\n", .{ image_index.items.len, completed_at.durationTo(started_at) });
 }
 
 pub fn showImageTexture(renderer: *sdl3.SDL_Renderer, tex: *sdl3.SDL_Texture) !void {
     var w: c_int = 0;
     var h: c_int = 0;
-    //    const render_size_started_at = try std.time.Instant.now();
+    //    const render_size_started_at = try std.Io.Clock.awake.now();
     _ = sdl3.SDL_GetCurrentRenderOutputSize(renderer, &w, &h);
-    //    const render_size_completed_at = try std.time.Instant.now();
+    //    const render_size_completed_at = try std.Io.Clock.awake.now();
     //    std.debug.print("Get render output size took ns={d}\n", .{
     //        render_size_completed_at.since(render_size_started_at),
     //    });
@@ -307,8 +314,8 @@ fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.order(u8, lhs_lower, rhs_lower) == .lt;
 }
 
-var parse_image_worker_pool: std.Thread.Pool = undefined;
-var image_index_work_completed_event: std.Thread.ResetEvent = std.Thread.ResetEvent{};
+var parse_image_worker_pool: std.Io.Group = .init;
+var image_index_work_completed_event: std.Io.Event = .unset;
 var starting_image_index: std.ArrayList([]const u8) = undefined;
 
 const ViewChunk = struct {
@@ -318,12 +325,13 @@ const ViewChunk = struct {
 
 const PendingImageTask = struct {
     filename: []const u8,
-    completed_event: *std.Thread.ResetEvent,
+    completed_event: *std.Io.Event,
     result: *ParseImageResult,
 };
 
 const MainContext = struct {
     a: std.mem.Allocator,
+    io: std.Io,
     window: *sdl3.SDL_Window,
     renderer: *sdl3.SDL_Renderer,
     frames: u64 = 0,
@@ -338,7 +346,7 @@ const MainContext = struct {
     image_index: std.ArrayList([]const u8),
     image_index_wip: std.ArrayList([]const u8),
     image_cache: ImageCache,
-    wip_completed: *std.Thread.ResetEvent,
+    wip_completed: *std.Io.Event,
     fullscreen: bool = true,
     command_in_progress: Command = Command.none,
     preload_index: usize = 0,
@@ -383,10 +391,11 @@ const MainContext = struct {
 
     fn init(
         a: std.mem.Allocator,
+        io: std.Io,
         window: *sdl3.SDL_Window,
         renderer: *sdl3.SDL_Renderer,
         read_file_worker: *ReadFileWorker,
-        image_index_completed_event: *std.Thread.ResetEvent,
+        image_index_completed_event: *std.Io.Event,
         image_index_wip: std.ArrayList([]const u8),
     ) !MainContext {
         var keybinds = std.hash_map.AutoHashMap(u32, Command).init(a);
@@ -401,15 +410,17 @@ const MainContext = struct {
         try keybinds.put(sdl3.SDLK_V, Command.clipboard_paste);
 
         const n_parse_threads = std.Thread.getCpuCount() catch 2;
-        try parse_image_worker_pool.init(.{
-            .allocator = std.heap.page_allocator,
-            .n_jobs = n_parse_threads,
-            //.stack_size = 200 * KB,
-        });
+        //parse_image_worker_pool = .init;
+        //(.{
+        //.allocator = std.heap.page_allocator,
+        //.n_jobs = n_parse_threads,
+        //.stack_size = 200 * KB,
+        //});
         std.debug.print("number of parse threads = {d}\n", .{n_parse_threads});
 
         return MainContext{
             .a = a,
+            .io = io,
             .window = window,
             .renderer = renderer,
             .image_index = .empty,
@@ -463,14 +474,14 @@ const MainContext = struct {
                 const task = self.pending_image_tasks.items[idx];
                 self.pending_image_tasks.items[idx].completed_event.reset();
 
-                const create_texture_started_at = try std.time.Instant.now();
+                const create_texture_started_at = std.Io.Clock.awake.now(self.io);
                 // TODO(@willemvds): Handle error case.
                 const image_texture = sdl3.SDL_CreateTextureFromSurface(self.renderer, self.pending_image_tasks.items[idx].result.ok);
-                const create_texture_completed_at = try std.time.Instant.now();
+                const create_texture_completed_at = std.Io.Clock.awake.now(self.io);
                 std.debug.print("[handleParseImageWorker@frame#{d}] Created new texture for {s}, ns={d}\n", .{
                     self.frames,
                     task.filename,
-                    create_texture_completed_at.since(create_texture_started_at),
+                    create_texture_completed_at.durationTo(create_texture_started_at).toNanoseconds(),
                 });
                 sdl3.SDL_DestroySurface(self.pending_image_tasks.items[idx].result.ok);
                 if (image_texture == null) {
@@ -495,13 +506,14 @@ const MainContext = struct {
     fn handleReadFileWorker(self: *Self) !void {
         if (self.read_file_worker.lastResult()) |result| {
             if (result.kind == ReadFileWorker.Result.Kind.ok) {
-                const re = try self.a.create(std.Thread.ResetEvent);
+                const re = try self.a.create(std.Io.Event);
                 const task = PendingImageTask{
                     .filename = result.filename,
                     .completed_event = re,
                     .result = try ParseImageResult.init(self.a),
                 };
-                try parse_image_worker_pool.spawn(parseImage, .{
+                try parse_image_worker_pool.concurrent(self.io, parseImage, .{
+                    self.io,
                     result.filename,
                     result.content,
                     task.result,
@@ -582,22 +594,22 @@ const MainContext = struct {
 
     fn buildView(self: *Self) !void {
         switch (self.view_mode) {
-            .waiting_for_image => |_| {
+            .waiting_for_image => {
                 //                const msg = try std.fmt.allocPrint(self.a, "Waiting for image {d} to get loaded...", .{slot});
                 //                try self.labels.append(try self.createTextLabel(msg, 10, 10));
             },
-            .showing_image => |_| {
+            .showing_image => {
                 if (self.showing_image_texture) |shown_image_texture| {
                     try showImageTexture(self.renderer, shown_image_texture);
                 }
             },
-            .showing_error => |_| {},
+            .showing_error => {},
         }
     }
 
     fn loop(self: *Self, events: *std.ArrayListAligned(Event, null)) !LoopResult {
         const frame_budget = 8 * Millisecond;
-        const frame_started_at = std.time.nanoTimestamp();
+        const frame_started_at = std.Io.Clock.awake.now(self.io).toNanoseconds();
         self.view_changed = false;
         var quit = false;
         var new_events: std.ArrayList(Event) = .empty;
@@ -649,9 +661,9 @@ const MainContext = struct {
             _ = sdl3.SDL_RenderClear(self.renderer);
 
             self.labels.clearRetainingCapacity();
-            //            const build_view_started_at = try std.time.Instant.now();
+            //            const build_view_started_at = try std.Io.Clock.awake.now();
             try self.buildView();
-            //            const build_view_completed_at = try std.time.Instant.now();
+            //            const build_view_completed_at = try std.Io.Clock.awake.now();
             //            std.debug.print("[buildView] took ns={d}\n", .{
             //                build_view_completed_at.since(build_view_started_at),
             //            });
@@ -663,7 +675,7 @@ const MainContext = struct {
             _ = sdl3.SDL_RenderPresent(self.renderer);
         }
 
-        const frame_completed_at = std.time.nanoTimestamp();
+        const frame_completed_at = std.Io.Clock.awake.now(self.io).toNanoseconds();
         const frame_cost = frame_completed_at - frame_started_at;
 
         const remaining_frame_budget = frame_budget - frame_cost;
@@ -673,7 +685,7 @@ const MainContext = struct {
             //                frame_budget,
             //                remaining_frame_budget,
             //            });
-            std.Thread.sleep(@as(u64, @intCast(remaining_frame_budget)));
+            //std.Thread.sleep(@as(u64, @intCast(remaining_frame_budget)));
         } else {
             std.debug.print("Frame#{d} went over budget {d}/{d}, view_changed?={any}\n", .{
                 self.frames,
@@ -814,12 +826,21 @@ const font_file = @embedFile("embed/SauceCodeProNerdFontMono-Regular.ttf");
 
 var font: *sdl3.TTF_Font = undefined;
 
-pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
-    var events: std.ArrayList(Event) = .empty; 
+pub fn imgpls_main(init: std.process.Init, _: i96) !void {
+    var events: std.ArrayList(Event) = .empty;
     defer events.deinit(ally);
 
-    const process_args = try processArgs(ally);
-    const starting_wd_path = try std.fs.cwd().realpathAlloc(ally, ".");
+    var buf: [std.fs.max_path_bytes]u8 = @splat(0);
+    //const path_len = try std.Io.Dir.cwd().realPath(init.io, &buf);
+    const path_len = try std.process.currentPath(init.io, &buf);
+    const starting_wd_path = buf[0..path_len];
+    std.debug.print("okey hey {d} {s}\n", .{
+        path_len,
+        starting_wd_path,
+    });
+
+    var process_args = try processArgs(init);
+    defer process_args.deinit(init.gpa);
 
     var target: []const u8 = starting_wd_path;
     if (process_args.items.len == 2) {
@@ -834,24 +855,25 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
 
     var entry_mode = MainEntryMode.cwd;
 
-    const target_handle = try std.fs.openFileAbsolute(target, .{});
-    const target_metadata = try target_handle.stat();
-    var dir: std.fs.Dir = undefined;
+    const target_handle = try std.Io.Dir.openFileAbsolute(init.io, target, .{});
+    std.debug.print("trying to open {s} {any}\n", .{ target, target_handle });
+    const target_metadata = try target_handle.stat(init.io);
+    var dir: std.Io.Dir = undefined;
     var dir_path: []const u8 = "";
     switch (target_metadata.kind) {
-        std.fs.File.Kind.file => {
+        std.Io.File.Kind.file => {
             entry_mode = MainEntryMode.file;
             if (std.fs.path.dirname(target)) |path| {
                 dir_path = path;
-                dir = try std.fs.openDirAbsolute(dir_path, .{});
+                dir = try std.Io.Dir.openDirAbsolute(init.io, dir_path, .{});
             } else {
                 return error.FAILED_TO_GET_PATH_WE_SUCK_ETC;
             }
         },
-        std.fs.File.Kind.directory => {
+        std.Io.File.Kind.directory => {
             entry_mode = MainEntryMode.dir;
             dir_path = target;
-            dir = try std.fs.openDirAbsolute(target, .{});
+            dir = try std.Io.Dir.openDirAbsolute(init.io, target, .{});
         },
         else => {
             std.debug.print("Unexpected file kind = {}\n", .{target_metadata.kind});
@@ -859,7 +881,7 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
         },
     }
 
-    const read_file_worker = try ReadFileWorker.init(ally, dir);
+    const read_file_worker = try ReadFileWorker.init(ally, init.io, dir);
 
     var load_first_image = false;
     if (entry_mode == MainEntryMode.file) {
@@ -871,6 +893,7 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
 
     starting_image_index = .empty;
     const thread = try std.Thread.spawn(.{}, buildImageIndex, .{
+        init.io,
         dir_path,
         &starting_image_index,
         &image_index_work_completed_event,
@@ -879,7 +902,7 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
     });
     thread.detach();
 
-    const sdl_init_started_at = try std.time.Instant.now();
+    const sdl_init_started_at = std.Io.Clock.awake.now(init.io);
     if (sdl3.SDL_Init(sdl3.SDL_INIT_VIDEO) == false) {
         return error.SDL;
     }
@@ -894,8 +917,8 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
         return error.SDL;
     }
 
-    const sdl_init_completed_at = try std.time.Instant.now();
-    std.debug.print("SDL_Init ns={d}\n", .{sdl_init_completed_at.since(sdl_init_started_at)});
+    const sdl_init_completed_at = std.Io.Clock.awake.now(init.io);
+    std.debug.print("SDL_Init ns={d}\n", .{sdl_init_completed_at.durationTo(sdl_init_started_at).toNanoseconds()});
 
     var num_displays: c_int = 0;
     const displays: [*c]sdl3.SDL_DisplayID = sdl3.SDL_GetDisplays(&num_displays);
@@ -923,15 +946,15 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
         sdl3.SDL_WINDOW_INPUT_FOCUS |
         sdl3.SDL_WINDOW_RESIZABLE;
 
-    const sdl_create_wr_started_at = try std.time.Instant.now();
+    const sdl_create_wr_started_at = std.Io.Clock.awake.now(init.io);
     const windowAndRendererResult = try createWindowAndRenderer(
         window_title,
         window_w,
         window_h,
         window_flags,
     );
-    const sdl_create_wr_completed_at = try std.time.Instant.now();
-    std.debug.print("SDL_CreateWindowAndRenderer ns={d}\n", .{sdl_create_wr_completed_at.since(sdl_create_wr_started_at)});
+    const sdl_create_wr_completed_at = std.Io.Clock.awake.now(init.io);
+    std.debug.print("SDL_CreateWindowAndRenderer ns={d}\n", .{sdl_create_wr_completed_at.durationTo(sdl_create_wr_started_at).toNanoseconds()});
 
     //const stdout_file = std.io.getStdOut().writer();
     //var bw = std.io.bufferedWriter(stdout_file);
@@ -944,6 +967,7 @@ pub fn imgpls_main(_: @TypeOf(std.time.nanoTimestamp())) !void {
 
     var main_context = try MainContext.init(
         ally,
+        init.io,
         windowAndRendererResult.window,
         windowAndRendererResult.renderer,
         read_file_worker,

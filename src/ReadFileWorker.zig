@@ -8,12 +8,13 @@ pub const Error = error{
 };
 
 a: std.mem.Allocator,
-dir: std.fs.Dir,
-mu: std.Thread.Mutex,
-cond: std.Thread.Condition,
+io: std.Io,
+dir: std.Io.Dir,
+mu: std.Io.Mutex,
+cond: std.Io.Condition,
 task: *Task,
 task_waiting: bool,
-task_completed_event: std.Thread.ResetEvent,
+task_completed_event: std.Io.Event,
 task_result: *Result,
 ready: bool = true,
 
@@ -33,8 +34,8 @@ pub const Result = struct {
     content: []const u8,
     err: anyerror,
 
-    started_at: std.time.Instant,
-    completed_at: std.time.Instant,
+    started_at: std.Io.Timestamp,
+    completed_at: std.Io.Timestamp,
 
     pub const Kind = enum {
         ok,
@@ -50,17 +51,19 @@ pub const Result = struct {
 
 pub fn init(
     a: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
 ) !*ReadFileWorker {
     const worker = try a.create(ReadFileWorker);
     worker.ready = true;
     worker.a = a;
+    worker.io = io;
     worker.dir = dir;
-    worker.mu = std.Thread.Mutex{};
-    worker.cond = std.Thread.Condition{};
+    worker.mu = .init;
+    worker.cond = .init;
     worker.task = try Task.init(a, "");
     worker.task_waiting = false;
-    worker.task_completed_event = std.Thread.ResetEvent{};
+    worker.task_completed_event = .unset;
     worker.task_completed_event.reset();
     worker.task_result = try Result.init(a);
 
@@ -76,11 +79,11 @@ pub fn queue(self: *ReadFileWorker, path: []const u8) !void {
     }
     self.task_completed_event.reset();
     self.ready = false;
-    self.mu.lock();
+    try self.mu.lock(self.io);
     self.task.filename = path;
     self.task_waiting = true;
-    self.mu.unlock();
-    self.cond.signal();
+    self.mu.unlock(self.io);
+    self.cond.signal(self.io);
 }
 
 pub fn lastResult(self: *ReadFileWorker) !*Result {
@@ -102,24 +105,24 @@ pub fn isBusy(self: *ReadFileWorker) bool {
 }
 
 fn readFile(worker: *ReadFileWorker) ![]const u8 {
-    const file = try worker.dir.openFile(worker.task.filename, .{});
-    const stat = try file.stat();
+    const file = try worker.dir.openFile(worker.io, worker.task.filename, .{});
+    const stat = try file.stat(worker.io);
     const buffer: []u8 = try worker.a.alloc(u8, stat.size);
-    const bytes_read = try file.read(buffer);
+    const bytes_read = try file.readPositionalAll(worker.io, buffer, 0);
     std.debug.assert(bytes_read == stat.size);
     return buffer;
 }
 
 fn readFileWorkerThread(worker: *ReadFileWorker, a: std.mem.Allocator) !void {
     while (true) {
-        worker.mu.lock();
-        defer worker.mu.unlock();
+        try worker.mu.lock(worker.io);
+        defer worker.mu.unlock(worker.io);
         while (worker.task_waiting == false) {
-            worker.cond.wait(&worker.mu);
+            try worker.cond.wait(worker.io, &worker.mu);
         }
         worker.task_result = try Result.init(a);
         worker.task_result.filename = worker.task.filename;
-        worker.task_result.started_at = try std.time.Instant.now();
+        worker.task_result.started_at = std.Io.Clock.awake.now(worker.io);
         if (readFile(worker)) |file_content| {
             worker.task_result.kind = Result.Kind.ok;
             worker.task_result.content = file_content;
@@ -127,9 +130,9 @@ fn readFileWorkerThread(worker: *ReadFileWorker, a: std.mem.Allocator) !void {
             worker.task_result.kind = Result.Kind.err;
             worker.task_result.err = err;
         }
-        worker.task_result.completed_at = try std.time.Instant.now();
+        worker.task_result.completed_at = std.Io.Clock.awake.now(worker.io);
 
         worker.task_waiting = false;
-        worker.task_completed_event.set();
+        worker.task_completed_event.set(worker.io);
     }
 }
